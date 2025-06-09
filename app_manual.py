@@ -45,7 +45,7 @@ def generate_answer_with_llm(user_question, relevant_chunks):
         {"role": "user", "content": f"[관련 매뉴얼 정보]\n{context_str}\n---\n[질문]\n{user_question}"}
     ]
     try:
-        response = openai.chat.completions.create(model="gpt-4o", messages=messages, temperature=0.7)
+        response = openai.chat.completions.create(model="o4-mini", messages=messages, temperature=0.7)
         return response.choices[0].message.content
     except Exception as e:
         return f"답변 생성 중 오류가 발생했습니다: {e}"
@@ -58,8 +58,8 @@ if model is None:
     st.error("챗봇 데이터 파일('manuals_vector_db.index' 또는 'all_manual_chunks.json')을 찾을 수 없습니다. GitHub 저장소를 확인해주세요.")
 else:
     st.success("모델과 데이터를 성공적으로 로드했습니다!", icon="✅")
-    st.markdown("회사 내부 매뉴얼에 대해 궁금한 점을 질문해보세요.")
-    user_question = st.text_input("질문 입력:", placeholder="예시: 신규 입사자 노트북 신청 절차는?")
+    st.markdown("궁금한 점을 질문해보세요.")
+    user_question = st.text_input("질문 입력:", placeholder="예시: 대규모내부거래 기준 금액은?")
     if st.button("질문하기", type="primary"):
         if user_question:
             with st.spinner("AI가 매뉴얼을 검토하고 답변을 생성하는 중입니다..."):
