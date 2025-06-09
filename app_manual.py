@@ -45,7 +45,7 @@ def generate_answer_with_llm(user_question, relevant_chunks):
         {"role": "user", "content": f"[관련 매뉴얼 정보]\n{context_str}\n---\n[질문]\n{user_question}"}
     ]
     try:
-        response = openai.chat.completions.create(model="o4-mini", messages=messages, temperature=0.7)
+        response = openai.chat.completions.create(model="o4-mini", messages=messages, temperature=1)
         return response.choices[0].message.content
     except Exception as e:
         return f"답변 생성 중 오류가 발생했습니다: {e}"
