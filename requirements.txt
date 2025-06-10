@@ -5,3 +5,4 @@ faiss-cpu
 numpy
 openai
 langchain
+unstructured[pdf,local-inference]
