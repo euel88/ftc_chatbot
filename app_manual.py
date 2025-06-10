@@ -63,7 +63,7 @@ def generate_answer_with_llm(user_question, relevant_chunks):
     ]
     
     try:
-        response = openai.chat.completions.create(model="o3", messages=messages, temperature=1)
+        response = openai.chat.completions.create(model="gpt-4o", messages=messages, temperature=0.7)
         return response.choices[0].message.content
     except Exception as e:
         return f"답변 생성 중 오류가 발생했습니다: {e}"
