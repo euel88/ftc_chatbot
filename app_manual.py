@@ -1266,49 +1266,36 @@ def determine_temperature(query: str, complexity: str) -> float:
     return temp
 
 def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str:
-    """GPT-4o를 활용한 고품질 답변 생성"""
+    """AI를 활용한 고품질 답변 생성"""
     
-    has_outdated = stats.get('has_version_conflicts', False)
-    outdated_warnings = stats.get('outdated_warnings', [])
-    
+    # 컨텍스트 구성
     context_parts = []
-    latest_info_parts = []
-    outdated_info_parts = []
     
     for i, result in enumerate(results[:5]):
-        context_str = f"""
+        context_parts.append(f"""
 [참고 {i+1}] {result.source} (페이지 {result.page})
 {result.content}
-"""
-        if result.metadata.get('has_outdated_info'):
-            outdated_info_parts.append(context_str)
-        else:
-            latest_info_parts.append(context_str)
+""")
     
-    context_parts = latest_info_parts + outdated_info_parts
     context = "\n---\n".join(context_parts)
     
-    critical_updates = ""
-    if has_outdated:
-        critical_updates = "\n\n[중요 법규 변경사항]"
-        for warning in outdated_warnings:
-            if warning['severity'] == 'critical':
-                critical_updates += f"\n- {warning['regulation']}: {warning['found']} → {warning['current']} (변경일: {warning['changed_date']})"
-    
+    # 복잡도 정보 활용
     gpt_analysis = stats.get('gpt_analysis', {})
     complexity = gpt_analysis.get('query_analysis', {}).get('actual_complexity', 'medium')
     temperature = determine_temperature(query, complexity)
     
+    # 처리 모드별 특별 지시
     mode_instructions = {
-        'gpt_guided_direct': "GPT-4o가 선택한 직접 검색 결과를 바탕으로 간결하고 정확한 답변을 제공하세요.",
-        'gpt_guided_focused': "GPT-4o가 분석한 핵심 주제에 대해 상세하고 실무적인 답변을 제공하세요.",
-        'gpt_guided_comprehensive': "GPT-4o가 파악한 여러 관련 주제를 종합하여 포괄적인 답변을 제공하세요.",
+        'gpt_guided_direct': "직접 검색 결과를 바탕으로 간결하고 정확한 답변을 제공하세요.",
+        'gpt_guided_focused': "핵심 주제에 대해 상세하고 실무적인 답변을 제공하세요.",
+        'gpt_guided_comprehensive': "여러 관련 주제를 종합하여 포괄적인 답변을 제공하세요.",
         'fallback_traditional': "제공된 참고 자료를 바탕으로 간결하고 정확한 답변을 제공하세요."
     }
     
     mode = stats.get('processing_mode', 'fallback_traditional')
     extra_instruction = mode_instructions.get(mode, "")
     
+    # 카테고리별 특화 지시사항
     category = stats.get('category')
     if not category and gpt_analysis:
         primary_manual = gpt_analysis.get('search_strategy', {}).get('primary_manual')
@@ -1316,33 +1303,27 @@ def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str
     
     if category:
         category_instructions = {
-            '대규모내부거래': "특히 이사회 의결 요건, 공시 기한, 면제 조건을 명확히 설명하세요. 금액 기준은 반드시 최신 기준(100억원 이상 또는 자본금 및 자본총계 중 큰 금액의 5% 이상)을 사용하세요.",
+            '대규모내부거래': "이사회 의결 요건, 공시 기한, 면제 조건을 명확히 설명하세요.",
             '현황공시': "공시 주체, 시기, 제출 서류를 구체적으로 안내하세요.",
             '비상장사 중요사항': "공시 대상 거래, 기한, 제출 방법을 상세히 설명하세요."
         }
         extra_instruction += f"\n{category_instructions.get(category, '')}"
     
+    # 시스템 프롬프트
     system_prompt = f"""당신은 한국 공정거래위원회 전문가입니다.
-제공된 자료만을 근거로 정확하고 실무적인 답변을 제공하세요.
-
-질문 복잡도: {complexity}
-처리 방식: {mode}
-
-중요: 법규가 변경된 경우 반드시 최신 정보를 기준으로 답변하세요. 
-특히 대규모내부거래 금액 기준은 2023년부터 100억원 이상으로 변경되었습니다.
+제공된 자료를 근거로 정확하고 실무적인 답변을 제공하세요.
 
 답변은 다음 구조를 따라주세요:
-1. 핵심 답변 (1-2문장) - 최신 법규 기준
+1. 핵심 답변 (1-2문장)
 2. 상세 설명 (근거 조항 포함)
 3. 주의사항 또는 예외사항 (있는 경우)
-4. 법규 변경사항 (중요한 변경이 있었던 경우)
 
 {extra_instruction}"""
     
+    # AI 호출
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"""다음 자료를 바탕으로 질문에 답변해주세요.
-{critical_updates}
 
 [참고 자료]
 {context}
@@ -1350,8 +1331,7 @@ def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str
 [질문]
 {query}
 
-{"간결하고 명확하게" if complexity == 'simple' else "상세하고 실무적으로"} 답변해주세요.
-구버전 정보와 최신 정보가 상충하는 경우, 반드시 최신 정보를 기준으로 답변하세요."""}
+{"간결하고 명확하게" if complexity == 'simple' else "상세하고 실무적으로"} 답변해주세요."""}
     ]
     
     response = openai.chat.completions.create(
@@ -1453,7 +1433,7 @@ def main():
                 total_start_time = time.time()
                 
                 search_start_time = time.time()
-                with st.spinner("🔍 GPT-4o가 질문을 분석하고 최적의 검색 전략을 수립하는 중..."):
+                with st.spinner("🔍 질문을 분석하고 최적의 검색 전략을 수립하는 중..."):
                     results, stats = run_async_in_streamlit(rag.process_query(prompt, top_k=5))
                 search_time = time.time() - search_start_time
                 
@@ -1481,20 +1461,8 @@ def main():
                     st.metric("⏱️ 전체", f"{total_time:.1f}초")
                 
                 with st.expander("🔍 상세 정보 보기"):
-                    if stats.get('has_version_conflicts'):
-                        st.error("⚠️ **중요: 법규 변경사항 발견**")
-                        for warning in stats.get('outdated_warnings', []):
-                            if warning['severity'] == 'critical':
-                                st.warning(f"""
-                                📌 **{warning['regulation']}** 변경
-                                - 이전: {warning['found']}
-                                - 현재: **{warning['current']}** ✅
-                                - 변경일: {warning['changed_date']}
-                                """)
-                        st.info("💡 본 시스템은 최신 법규를 기준으로 답변을 제공합니다.")
-                    
                     if gpt_analysis:
-                        st.subheader("🤖 GPT-4o 질문 분석")
+                        st.subheader("🤖 AI 질문 분석")
                         st.json({
                             "핵심 의도": gpt_analysis.get('query_analysis', {}).get('core_intent', ''),
                             "실제 복잡도": gpt_analysis.get('query_analysis', {}).get('actual_complexity', ''),
@@ -1503,10 +1471,10 @@ def main():
                         })
                     
                     mode_descriptions = {
-                        'gpt_guided_direct': "GPT-4o가 단순한 질문으로 판단하여 직접 검색을 수행했습니다.",
-                        'gpt_guided_focused': "GPT-4o가 특정 주제에 대한 집중 검색을 수행했습니다.",
-                        'gpt_guided_comprehensive': "GPT-4o가 여러 주제에 걸친 종합 분석을 수행했습니다.",
-                        'fallback_traditional': "GPT-4o 분석이 실패하여 기존 방식으로 처리했습니다."
+                        'gpt_guided_direct': "AI가 단순한 질문으로 판단하여 직접 검색을 수행했습니다.",
+                        'gpt_guided_focused': "AI가 특정 주제에 대한 집중 검색을 수행했습니다.",
+                        'gpt_guided_comprehensive': "AI가 여러 주제에 걸친 종합 분석을 수행했습니다.",
+                        'fallback_traditional': "기본 검색 방식으로 처리했습니다."
                     }
                     st.info(f"🎯 **처리 방식**: {mode_descriptions.get(mode, '알 수 없음')}")
                     
@@ -1515,21 +1483,13 @@ def main():
                     
                     st.subheader("📚 참고 자료")
                     for i, result in enumerate(results[:3]):
-                        version_indicator = ""
-                        if result.metadata.get('has_outdated_info'):
-                            version_indicator = " ⚠️ **[구버전 정보 포함]**"
-                        
-                        st.caption(f"**{result.source}** - 페이지 {result.page} (관련도: {result.score:.2f}){version_indicator}")
+                        st.caption(f"**{result.source}** - 페이지 {result.page} (관련도: {result.score:.2f})")
                         
                         if result.document_date:
                             st.caption(f"📅 문서 날짜: {result.document_date}")
                         
                         with st.container():
                             content = result.content[:300] + "..." if len(result.content) > 300 else result.content
-                            
-                            if '50억원' in content or '30억원' in content:
-                                content = re.sub(r'(50억원|30억원)', r'~~\1~~ → **100억원**', content)
-                            
                             st.text(content)
                     
                     if total_time < 5:
@@ -1580,7 +1540,7 @@ def main():
             st.rerun()
         
         st.divider()
-        st.caption("💡 GPT-4o가 모든 질문의 핵심을 파악하여 최적의 답변을 제공합니다.")
+        st.caption("💡 AI가 모든 질문의 핵심을 파악하여 최적의 답변을 제공합니다.")
     
     if "new_question" in st.session_state:
         st.session_state.messages.append({"role": "user", "content": st.session_state.new_question})
