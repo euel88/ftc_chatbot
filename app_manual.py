@@ -531,23 +531,42 @@ class GPTIntegratedSearch:
         
         질문: {query}
         
-        다음을 JSON 형식으로 응답하세요:
+        반드시 다음과 같은 JSON 형식으로 응답하세요:
         {{
-            "key_concepts": ["핵심 개념들"],
-            "related_concepts": ["관련 개념들"],
-            "legal_areas": ["관련 법률 영역"],
+            "key_concepts": ["핵심 개념1", "핵심 개념2"],
+            "related_concepts": ["관련 개념1", "관련 개념2"],
+            "legal_areas": ["관련 법률 영역1", "관련 법률 영역2"],
             "search_focus": "검색 초점 설명"
         }}
         """
         
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            response_format={"type": "json_object"}
-        )
-        
-        return json.loads(response.choices[0].message.content)
+        try:
+            response = openai.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+            
+            strategy = json.loads(response.choices[0].message.content)
+            
+            # 필수 필드 검증
+            required_fields = ["key_concepts", "related_concepts", "legal_areas", "search_focus"]
+            for field in required_fields:
+                if field not in strategy:
+                    strategy[field] = [] if field != "search_focus" else "일반 검색"
+            
+            return strategy
+            
+        except Exception as e:
+            print(f"Error in _develop_search_strategy: {str(e)}")
+            # 오류 발생 시 기본 전략 반환
+            return {
+                "key_concepts": [query],
+                "related_concepts": [],
+                "legal_areas": ["공정거래법"],
+                "search_focus": "질문과 관련된 모든 문서 검색"
+            }
     
     def _evaluate_chunks_batch(self, query: str, chunks: List[Dict], strategy: Dict) -> List[Dict]:
         """GPT가 청크 배치의 관련성을 평가"""
@@ -566,36 +585,68 @@ class GPTIntegratedSearch:
         
         {chunks_summary}
         
-        JSON 배열 형식으로 응답하세요:
-        [
-            {{"chunk_index": 0, "relevance_score": 8.5, "reason": "관련성 이유"}},
-            ...
-        ]
+        반드시 다음과 같은 JSON 객체 형식으로 응답하세요:
+        {{
+            "evaluations": [
+                {{"chunk_index": 0, "relevance_score": 8.5, "reason": "관련성 이유"}},
+                {{"chunk_index": 1, "relevance_score": 6.0, "reason": "관련성 이유"}}
+            ]
+        }}
         """
         
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=2000,
-            response_format={"type": "json_object"}
-        )
-        
-        evaluations = json.loads(response.choices[0].message.content)
-        
-        # 원본 청크 정보와 병합
-        results = []
-        for eval_item in evaluations.get('evaluations', evaluations):
-            idx = eval_item['chunk_index']
-            if idx < len(chunks):
-                chunk = chunks[idx]
-                results.append({
-                    'chunk': chunk,
-                    'relevance_score': eval_item['relevance_score'],
-                    'reason': eval_item.get('reason', '')
-                })
-        
-        return results
+        try:
+            response = openai.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=2000,
+                response_format={"type": "json_object"}
+            )
+            
+            # 응답 파싱
+            response_content = response.choices[0].message.content
+            evaluations = json.loads(response_content)
+            
+            # 응답 구조 검증
+            if isinstance(evaluations, dict) and 'evaluations' in evaluations:
+                eval_list = evaluations['evaluations']
+            elif isinstance(evaluations, list):
+                eval_list = evaluations
+            else:
+                # 예상치 못한 형식인 경우 빈 리스트 반환
+                print(f"Unexpected GPT response format: {evaluations}")
+                return []
+            
+            # 원본 청크 정보와 병합
+            results = []
+            for eval_item in eval_list:
+                # 타입 검증
+                if not isinstance(eval_item, dict):
+                    continue
+                    
+                # 필수 필드 확인
+                if 'chunk_index' not in eval_item:
+                    continue
+                    
+                idx = eval_item.get('chunk_index', -1)
+                if isinstance(idx, int) and 0 <= idx < len(chunks):
+                    chunk = chunks[idx]
+                    results.append({
+                        'chunk': chunk,
+                        'relevance_score': float(eval_item.get('relevance_score', 0)),
+                        'reason': eval_item.get('reason', '')
+                    })
+            
+            return results
+            
+        except Exception as e:
+            print(f"Error in _evaluate_chunks_batch: {str(e)}")
+            # 오류 발생 시 기본 점수로 모든 청크 반환
+            return [{
+                'chunk': chunk,
+                'relevance_score': 5.0,
+                'reason': 'GPT 평가 실패로 기본 점수 부여'
+            } for chunk in chunks]
     
     def _finalize_ranking(self, query: str, candidates: List[Dict], top_k: int) -> List[SearchResult]:
         """GPT가 최종 순위를 결정"""
@@ -613,37 +664,91 @@ class GPTIntegratedSearch:
         
         {candidates_summary}
         
-        선택한 후보의 인덱스를 순서대로 나열하세요: [0, 3, 1, ...]
+        반드시 JSON 형식으로 응답하세요:
+        {{
+            "selected_indices": [0, 3, 1, 2, 4],
+            "explanation": "선택 이유 설명"
+        }}
+        
+        selected_indices는 선택한 후보의 인덱스를 순서대로 나열한 배열이어야 합니다.
         """
         
-        response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2
-        )
-        
-        # 응답에서 인덱스 추출
-        content = response.choices[0].message.content
-        indices = re.findall(r'\d+', content)[:top_k]
-        
-        # SearchResult 객체 생성
-        results = []
-        for idx_str in indices:
-            idx = int(idx_str)
-            if idx < len(candidates):
-                candidate = candidates[idx]
+        try:
+            response = openai.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                response_format={"type": "json_object"}
+            )
+            
+            # 응답 파싱
+            result = json.loads(response.choices[0].message.content)
+            
+            # 인덱스 추출
+            if isinstance(result, dict) and 'selected_indices' in result:
+                indices = result['selected_indices']
+            else:
+                # 텍스트에서 숫자 추출 시도
+                content = str(result)
+                indices = re.findall(r'\d+', content)[:top_k]
+            
+            # SearchResult 객체 생성
+            results = []
+            for idx in indices[:top_k]:
+                try:
+                    idx_int = int(idx)
+                    if 0 <= idx_int < len(candidates):
+                        candidate = candidates[idx_int]
+                        chunk = candidate['chunk']
+                        results.append(SearchResult(
+                            chunk_id=chunk.get('chunk_id', str(idx_int)),
+                            content=chunk['content'],
+                            score=candidate['relevance_score'],
+                            source=chunk['source'],
+                            page=chunk['page'],
+                            chunk_type=chunk.get('chunk_type', 'unknown'),
+                            metadata=json.loads(chunk.get('metadata', '{}'))
+                        ))
+                except (ValueError, IndexError):
+                    continue
+            
+            # 결과가 부족하면 상위 후보로 채우기
+            if len(results) < top_k:
+                for candidate in candidates:
+                    if len(results) >= top_k:
+                        break
+                    # 이미 추가된 청크인지 확인
+                    chunk_id = candidate['chunk'].get('chunk_id', '')
+                    if not any(r.chunk_id == chunk_id for r in results):
+                        chunk = candidate['chunk']
+                        results.append(SearchResult(
+                            chunk_id=chunk_id or str(len(results)),
+                            content=chunk['content'],
+                            score=candidate['relevance_score'],
+                            source=chunk['source'],
+                            page=chunk['page'],
+                            chunk_type=chunk.get('chunk_type', 'unknown'),
+                            metadata=json.loads(chunk.get('metadata', '{}'))
+                        ))
+            
+            return results
+            
+        except Exception as e:
+            print(f"Error in _finalize_ranking: {str(e)}")
+            # 오류 발생 시 점수 순으로 상위 k개 반환
+            results = []
+            for i, candidate in enumerate(candidates[:top_k]):
                 chunk = candidate['chunk']
                 results.append(SearchResult(
-                    chunk_id=chunk.get('chunk_id', str(idx)),
+                    chunk_id=chunk.get('chunk_id', str(i)),
                     content=chunk['content'],
-                    score=candidate['relevance_score'],
+                    score=candidate.get('relevance_score', 5.0),
                     source=chunk['source'],
                     page=chunk['page'],
                     chunk_type=chunk.get('chunk_type', 'unknown'),
                     metadata=json.loads(chunk.get('metadata', '{}'))
                 ))
-        
-        return results
+            return results
     
     def _estimate_cost(self, num_chunks: int) -> float:
         """예상 비용 계산 (달러)"""
