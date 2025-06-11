@@ -12,6 +12,7 @@ from collections import defaultdict, Counter
 import time
 from dataclasses import dataclass
 import pandas as pd
+import os  # 파일 시스템 작업을 위해 필요
 
 # --- 1. 페이지 설정 및 스타일링 ---
 st.set_page_config(
