@@ -6,4 +6,3 @@ openai
 pandas
 torch>=1.9.0
 transformers>=4.20.0
-python>=3.8,<3.12
