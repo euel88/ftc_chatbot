@@ -339,6 +339,31 @@ def generate_answer(query: str, results: List[SearchResult], category: str = Non
     
     context = "\n---\n".join(context_parts)
     
+    # 질문 유형 분석 (temperature 조정용)
+    def determine_temperature(query: str) -> float:
+        """질문 유형에 따라 최적의 temperature 결정"""
+        query_lower = query.lower()
+        
+        # 단순 사실 확인 질문 (낮은 temperature)
+        if any(keyword in query_lower for keyword in ['언제', '며칠', '기한', '금액', '퍼센트', '%']):
+            return 0.1
+        
+        # 정의나 범위 질문 (중간 temperature)
+        elif any(keyword in query_lower for keyword in ['정의', '범위', '포함', '해당', '대상']):
+            return 0.3
+        
+        # 복잡한 상황 판단 질문 (높은 temperature)
+        elif any(keyword in query_lower for keyword in ['어떻게', '경우', '만약', '예외', '가능', '방법']):
+            return 0.5
+        
+        # 전략적 자문 질문 (더 높은 temperature)
+        elif any(keyword in query_lower for keyword in ['전략', '대응', '리스크', '주의사항', '고려사항']):
+            return 0.7
+        
+        # 기본값
+        else:
+            return 0.3
+    
     # 카테고리별 특화 지시사항
     category_instructions = {
         '대규모내부거래': "이사회 의결 요건, 공시 기한, 예외사항을 중심으로 설명하세요.",
@@ -348,13 +373,22 @@ def generate_answer(query: str, results: List[SearchResult], category: str = Non
     
     extra_instruction = category_instructions.get(category, "") if category else ""
     
-    # 프롬프트
+    # Temperature 결정
+    optimal_temperature = determine_temperature(query)
+    
+    # 프롬프트 (temperature에 따라 지시사항 조정)
+    system_content = """당신은 공정거래위원회 전문가입니다. 
+제공된 자료만을 근거로 정확하고 실무적인 답변을 제공하세요.
+답변은 명확하고 구조적으로 작성하며, 근거 조항이나 페이지를 명시하세요."""
+    
+    # 높은 temperature일 때는 더 깊은 분석 요청
+    if optimal_temperature >= 0.5:
+        system_content += "\n다양한 관점과 실무적 고려사항을 포함하여 종합적으로 분석해주세요."
+    
     messages = [
         {
             "role": "system", 
-            "content": """당신은 공정거래위원회 전문가입니다. 
-제공된 자료만을 근거로 정확하고 실무적인 답변을 제공하세요.
-답변은 명확하고 구조적으로 작성하며, 근거 조항이나 페이지를 명시하세요."""
+            "content": system_content
         },
         {
             "role": "user",
@@ -368,15 +402,15 @@ def generate_answer(query: str, results: List[SearchResult], category: str = Non
 
 {extra_instruction}
 
-간결하고 명확하게 답변해주세요."""
+{"간결하고 명확하게" if optimal_temperature < 0.3 else "상세하고 실무적으로"} 답변해주세요."""
         }
     ]
     
-    # GPT 호출
+    # GPT 호출 (동적 temperature 적용)
     response = openai.chat.completions.create(
         model="gpt-4o",  # GPT-4o 모델 사용 (더 정확한 답변)
         messages=messages,
-        temperature=0.1,
+        temperature=optimal_temperature,
         max_tokens=1000
     )
     
@@ -413,7 +447,26 @@ def main():
         # 이전 대화 표시
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
-                st.write(message["content"])
+                if message["role"] == "user":
+                    st.write(message["content"])
+                else:
+                    # assistant 메시지 처리
+                    if isinstance(message["content"], dict):
+                        # 새로운 형식 (시간 정보 포함)
+                        st.write(message["content"]["content"])
+                        
+                        # 시간 정보가 있으면 표시
+                        if "total_time" in message["content"]:
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("🔍 검색", f"{message['content']['search_time']:.1f}초")
+                            with col2:
+                                st.metric("✍️ 답변 생성", f"{message['content']['generation_time']:.1f}초")
+                            with col3:
+                                st.metric("⏱️ 전체", f"{message['content']['total_time']:.1f}초")
+                    else:
+                        # 이전 형식 (하위 호환성)
+                        st.write(message["content"])
         
         # 사용자 입력
         if prompt := st.chat_input("질문을 입력하세요 (예: 대규모내부거래 공시 기한은?)"):
@@ -424,16 +477,61 @@ def main():
             
             # AI 응답
             with st.chat_message("assistant"):
+                # 전체 시간 측정 시작
+                total_start_time = time.time()
+                
                 # 검색 수행
+                search_start_time = time.time()
                 with st.spinner("관련 자료를 검색하는 중..."):
                     results, stats = rag.search(prompt, top_k=5)
+                search_time = time.time() - search_start_time
                 
                 # 답변 생성
+                generation_start_time = time.time()
                 with st.spinner("답변을 생성하는 중..."):
                     answer = generate_answer(prompt, results, stats.get('category'))
+                generation_time = time.time() - generation_start_time
+                
+                # 전체 시간 계산
+                total_time = time.time() - total_start_time
                 
                 # 답변 표시
                 st.write(answer)
+                
+                # 시간 정보 표시 (작은 메트릭으로 깔끔하게)
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("🔍 검색", f"{search_time:.1f}초")
+                with col2:
+                    st.metric("✍️ 답변 생성", f"{generation_time:.1f}초")
+                with col3:
+                    st.metric("⏱️ 전체", f"{total_time:.1f}초")
+                
+                # 성능 분석 (선택적으로 볼 수 있게)
+                with st.expander("🚀 성능 상세 분석"):
+                    # 시각적 비율 표시
+                    search_percent = (search_time / total_time) * 100
+                    generation_percent = (generation_time / total_time) * 100
+                    
+                    st.write("**시간 분포:**")
+                    st.progress(search_percent / 100)
+                    st.caption(f"검색: {search_percent:.1f}% ({search_time:.2f}초)")
+                    
+                    st.progress(generation_percent / 100)
+                    st.caption(f"답변 생성: {generation_percent:.1f}% ({generation_time:.2f}초)")
+                    
+                    # 추가 통계
+                    if stats.get('category'):
+                        st.write(f"**검색 최적화:** {stats['category']} 카테고리 우선 검색")
+                        st.write(f"**검색 범위:** {stats['primary_searched']}개 / 전체 {stats['total_chunks']}개")
+                    
+                    # 성능 평가
+                    if total_time < 3:
+                        st.success("⚡ 매우 빠른 응답!")
+                    elif total_time < 5:
+                        st.info("✅ 적절한 응답 속도")
+                    else:
+                        st.warning("⏳ 응답이 다소 느렸습니다")
                 
                 # 출처 정보 (접을 수 있게)
                 with st.expander("📚 참고 자료 보기"):
@@ -442,8 +540,15 @@ def main():
                         st.text(result.content[:200] + "...")
                         st.divider()
                 
-                # 세션에 저장
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+                # 세션에 저장 (시간 정보 포함)
+                response_data = {
+                    "content": answer,
+                    "search_time": search_time,
+                    "generation_time": generation_time,
+                    "total_time": total_time,
+                    "timestamp": time.time()
+                }
+                st.session_state.messages.append({"role": "assistant", "content": response_data})
     
     # 하단 안내
     st.divider()
