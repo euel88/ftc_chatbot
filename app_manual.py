@@ -365,7 +365,9 @@ class ComplexityAssessor:
         
         # 추가 복잡도 요인
         # 1. 질문 길이
-        if len(query) > 100:
+        if len(query) > 150:  # 너무 긴 질문은 복잡도 상향 조정
+            complex_score += 2
+        elif len(query) > 100:
             complex_score += 1
         elif len(query) < 30:
             simple_score += 0.5
@@ -376,13 +378,13 @@ class ComplexityAssessor:
         if '?' in query and query.count('?') > 1:
             complex_score += 1  # 여러 질문
             
-        # 최종 복잡도 결정
+        # 최종 복잡도 결정 (임계값 조정으로 GPT 사용 줄이기)
         total_score = simple_score + medium_score + complex_score
         
         if total_score == 0:
             complexity = QueryComplexity.MEDIUM
             confidence = 0.5
-        elif complex_score > simple_score * 2:
+        elif complex_score > simple_score * 3:  # 기준을 2배에서 3배로 상향
             complexity = QueryComplexity.COMPLEX
             confidence = min(complex_score / (total_score + 1), 0.9)
         elif simple_score > complex_score * 2:
@@ -490,7 +492,8 @@ class GPTIntegratedSearch:
     
     def __init__(self, chunks: List[Dict]):
         self.chunks = chunks
-        self.max_chunks_per_call = 50  # GPT 토큰 제한 고려
+        self.max_chunks_per_call = 20  # 토큰 제한 및 속도 고려
+        self.max_chunks_to_evaluate = 100  # 전체 평가 청크 수 제한
         
     def search_and_analyze(self, query: str, top_k: int = 5) -> Tuple[List[SearchResult], Dict]:
         """GPT가 검색과 분석을 통합적으로 수행"""
@@ -499,27 +502,41 @@ class GPTIntegratedSearch:
         # 1단계: GPT가 검색 전략 수립
         search_strategy = self._develop_search_strategy(query)
         
-        # 2단계: 청크를 배치로 나누어 GPT 평가
+        # 2단계: 전체 청크 중 일부만 샘플링하여 평가 (성능 최적화)
+        if len(self.chunks) > self.max_chunks_to_evaluate:
+            # 청크를 균등하게 샘플링
+            step = len(self.chunks) // self.max_chunks_to_evaluate
+            sampled_chunks = [self.chunks[i] for i in range(0, len(self.chunks), step)][:self.max_chunks_to_evaluate]
+        else:
+            sampled_chunks = self.chunks
+        
+        # 3단계: 샘플링된 청크를 배치로 나누어 GPT 평가
         all_evaluations = []
-        for i in range(0, len(self.chunks), self.max_chunks_per_call):
-            batch = self.chunks[i:i + self.max_chunks_per_call]
+        for i in range(0, len(sampled_chunks), self.max_chunks_per_call):
+            batch = sampled_chunks[i:i + self.max_chunks_per_call]
             evaluations = self._evaluate_chunks_batch(query, batch, search_strategy)
             all_evaluations.extend(evaluations)
+            
+            # 시간 제한: 30초 이상 걸리면 중단
+            if time.time() - start_time > 30:
+                print(f"GPT search timeout after evaluating {len(all_evaluations)} chunks")
+                break
         
-        # 3단계: 상위 결과 선택 및 재정렬
+        # 4단계: 상위 결과 선택 및 재정렬
         all_evaluations.sort(key=lambda x: x['relevance_score'], reverse=True)
         top_results = all_evaluations[:top_k * 2]  # 여유있게 선택
         
-        # 4단계: GPT가 최종 순위 결정
+        # 5단계: GPT가 최종 순위 결정
         final_results = self._finalize_ranking(query, top_results, top_k)
         
         # 통계 생성
         stats = {
             'method': 'gpt_integrated',
             'search_time': time.time() - start_time,
-            'chunks_evaluated': len(self.chunks),
+            'chunks_evaluated': len(all_evaluations),
+            'total_chunks': len(self.chunks),
             'strategy': search_strategy,
-            'estimated_cost': self._estimate_cost(len(self.chunks))
+            'estimated_cost': self._estimate_cost(len(all_evaluations))
         }
         
         return final_results, stats
@@ -773,12 +790,21 @@ class HybridRAGPipeline:
         self.complexity_assessor = ComplexityAssessor()
         self.gpt_search = GPTIntegratedSearch(chunks)
         
+        # GPT-4o 분석기 추가
+        self.gpt4o_analyzer = GPT4oQueryAnalyzer()
+        
         # 버전 관리 및 충돌 해결 시스템 초기화
         self.version_manager = DocumentVersionManager()
         self.conflict_resolver = ConflictResolver(self.version_manager)
         
         # 매뉴얼별 청크 인덱스 미리 구축
         self.manual_indices = self._build_manual_indices()
+        
+        # 청크 정보 요약 (GPT-4o 분석에 제공)
+        self.chunks_info = {
+            category: len(indices) 
+            for category, indices in self.manual_indices.items()
+        }
         
         # 검색 결과 캐시
         self.search_cache = {}
@@ -814,50 +840,291 @@ class HybridRAGPipeline:
         
         return dict(indices)
     
-    def process_query(self, query: str, top_k: int = 5) -> Tuple[List[SearchResult], Dict]:
-        """질문 복잡도에 따라 최적의 처리 방식을 선택"""
-        # 1. 복잡도 평가
-        complexity, confidence, complexity_analysis = self.complexity_assessor.assess(query)
+    async def process_query(self, query: str, top_k: int = 5) -> Tuple[List[SearchResult], Dict]:
+        """GPT-4o가 질문을 분석하여 최적의 처리 방식을 선택"""
+        start_time = time.time()
         
-        # 2. 복잡도에 따른 처리
-        if complexity == QueryComplexity.SIMPLE:
-            # 단순 질문: 빠른 전통적 검색
-            results, stats = self._fast_traditional_search(query, top_k)
-            stats['processing_mode'] = 'fast_traditional'
-            
-        elif complexity == QueryComplexity.COMPLEX:
-            # 복잡한 질문: GPT 통합 처리
-            results, stats = self.gpt_search.search_and_analyze(query, top_k)
-            stats['processing_mode'] = 'gpt_integrated'
-            
-        else:  # MEDIUM
-            # 중간 복잡도: 하이브리드 접근
-            # 먼저 빠른 검색으로 후보를 찾고, GPT로 정제
-            initial_results, initial_stats = self._fast_traditional_search(query, top_k * 3)
-            results, stats = self._gpt_enhance_results(query, initial_results, top_k)
-            stats['processing_mode'] = 'hybrid'
-            stats['initial_search_time'] = initial_stats['search_time']
+        # 1. GPT-4o로 질문 분석 및 전략 수립
+        analysis_start = time.time()
+        try:
+            gpt_analysis = await self.gpt4o_analyzer.analyze_and_strategize(
+                query, self.chunks_info
+            )
+            analysis_time = time.time() - analysis_start
+        except Exception as e:
+            print(f"GPT-4o analysis failed: {str(e)}, falling back to rule-based")
+            # GPT 분석 실패 시 기존 방식으로 폴백
+            return self._fallback_process_query(query, top_k)
         
-        # 3. 최신성 검증 및 충돌 해결
+        # 2. GPT-4o의 분석 결과에 따른 처리
+        actual_complexity = gpt_analysis['query_analysis']['actual_complexity']
+        search_approach = gpt_analysis['search_strategy']['approach']
+        
+        # 검색 통계 초기화
+        stats = {
+            'gpt_analysis': gpt_analysis,
+            'analysis_time': analysis_time,
+            'actual_complexity': actual_complexity,
+            'search_approach': search_approach
+        }
+        
+        # 3. 검색 전략에 따른 실행
+        if search_approach == 'direct_lookup':
+            # 직접 조회: 매우 단순한 질문
+            results, search_stats = await self._gpt_guided_direct_search(
+                query, gpt_analysis, top_k
+            )
+            stats['processing_mode'] = 'gpt_guided_direct'
+            
+        elif search_approach == 'focused_search':
+            # 집중 검색: 특정 주제에 대한 상세 검색
+            results, search_stats = await self._gpt_guided_focused_search(
+                query, gpt_analysis, top_k
+            )
+            stats['processing_mode'] = 'gpt_guided_focused'
+            
+        else:  # comprehensive_analysis
+            # 종합 분석: 여러 주제가 얽힌 복잡한 질문
+            results, search_stats = await self._gpt_guided_comprehensive_search(
+                query, gpt_analysis, top_k
+            )
+            stats['processing_mode'] = 'gpt_guided_comprehensive'
+        
+        # 4. 최신성 검증 및 충돌 해결
         results = self.conflict_resolver.resolve_conflicts(results, query)
         
-        # 4. 구버전 정보 경고 수집
+        # 5. 구버전 정보 경고 수집
         outdated_warnings = []
         for result in results:
             if result.metadata.get('has_outdated_info'):
                 outdated_warnings.extend(result.metadata.get('warnings', []))
         
-        # 5. 복잡도 정보 추가
-        stats['complexity'] = complexity.value
-        stats['complexity_confidence'] = confidence
-        stats['complexity_analysis'] = complexity_analysis
+        # 6. 최종 통계 업데이트
+        stats.update(search_stats)
+        stats['total_time'] = time.time() - start_time
         stats['outdated_warnings'] = outdated_warnings
         stats['has_version_conflicts'] = len(outdated_warnings) > 0
         
         return results, stats
     
+    async def _gpt_guided_direct_search(self, query: str, gpt_analysis: Dict, 
+                                       top_k: int) -> Tuple[List[SearchResult], Dict]:
+        """GPT 분석을 기반으로 한 직접 검색 (가장 빠름)"""
+        start_time = time.time()
+        
+        # GPT가 지정한 매뉴얼에서만 검색
+        primary_manual = gpt_analysis['search_strategy']['primary_manual']
+        search_keywords = gpt_analysis['search_strategy']['search_keywords']
+        
+        # 해당 매뉴얼의 청크 인덱스 가져오기
+        target_indices = self.manual_indices.get(primary_manual, [])[:100]  # 최대 100개
+        
+        # 키워드 강화 쿼리 생성
+        enhanced_query = f"{query} {' '.join(search_keywords)}"
+        query_vector = self.embedding_model.encode([enhanced_query])
+        query_vector = np.array(query_vector, dtype=np.float32)
+        
+        # 빠른 벡터 검색
+        k_search = min(len(target_indices), top_k * 3)
+        scores, indices = self.index.search(query_vector, k_search)
+        
+        # 결과 수집
+        results = []
+        target_set = set(target_indices)
+        
+        for idx, score in zip(indices[0], scores[0]):
+            if idx in target_set:
+                chunk = self.chunks[idx]
+                results.append(SearchResult(
+                    chunk_id=chunk.get('chunk_id', str(idx)),
+                    content=chunk['content'],
+                    score=float(score),
+                    source=chunk['source'],
+                    page=chunk['page'],
+                    chunk_type=chunk.get('chunk_type', 'unknown'),
+                    metadata=json.loads(chunk.get('metadata', '{}'))
+                ))
+                if len(results) >= top_k:
+                    break
+        
+        stats = {
+            'search_time': time.time() - start_time,
+            'searched_chunks': len(target_indices),
+            'search_method': 'direct_vector'
+        }
+        
+        return results, stats
+    
+    async def _gpt_guided_focused_search(self, query: str, gpt_analysis: Dict, 
+                                        top_k: int) -> Tuple[List[SearchResult], Dict]:
+        """GPT 분석을 기반으로 한 집중 검색"""
+        start_time = time.time()
+        
+        # 주요 개념들에 대한 타겟 검색
+        primary_manual = gpt_analysis['search_strategy']['primary_manual']
+        search_keywords = gpt_analysis['search_strategy']['search_keywords']
+        expected_chunks = gpt_analysis['search_strategy']['expected_chunks_needed']
+        
+        # 예상 청크 수에 따라 검색 범위 조정
+        search_limit = min(expected_chunks * 2, 200)
+        target_indices = self.manual_indices.get(primary_manual, [])[:search_limit]
+        
+        # 요구사항에 따른 추가 필터링
+        requirements = gpt_analysis['answer_requirements']
+        if requirements.get('needs_specific_numbers'):
+            # 숫자가 포함된 청크 우선
+            target_indices = [idx for idx in target_indices 
+                            if re.search(r'\d+억|\d+%', self.chunks[idx]['content'])]
+        
+        # 벡터 검색 수행
+        enhanced_query = f"{query} {' '.join(search_keywords)}"
+        query_vector = self.embedding_model.encode([enhanced_query])
+        query_vector = np.array(query_vector, dtype=np.float32)
+        
+        k_search = min(len(target_indices), top_k * 5)
+        scores, indices = self.index.search(query_vector, k_search)
+        
+        # 결과 수집 및 GPT 분석 기반 재정렬
+        results = []
+        target_set = set(target_indices)
+        
+        for idx, score in zip(indices[0], scores[0]):
+            if idx in target_set:
+                chunk = self.chunks[idx]
+                
+                # GPT 분석과의 관련성 점수 계산
+                relevance_boost = self._calculate_gpt_relevance(
+                    chunk['content'], gpt_analysis
+                )
+                
+                results.append(SearchResult(
+                    chunk_id=chunk.get('chunk_id', str(idx)),
+                    content=chunk['content'],
+                    score=float(score) * (1 + relevance_boost),
+                    source=chunk['source'],
+                    page=chunk['page'],
+                    chunk_type=chunk.get('chunk_type', 'unknown'),
+                    metadata=json.loads(chunk.get('metadata', '{}'))
+                ))
+                
+                if len(results) >= top_k * 2:  # 여유있게 수집
+                    break
+        
+        # 점수 기준 재정렬 후 상위 k개 선택
+        results.sort(key=lambda x: x.score, reverse=True)
+        results = results[:top_k]
+        
+        stats = {
+            'search_time': time.time() - start_time,
+            'searched_chunks': len(target_indices),
+            'search_method': 'focused_vector'
+        }
+        
+        return results, stats
+    
+    async def _gpt_guided_comprehensive_search(self, query: str, gpt_analysis: Dict, 
+                                              top_k: int) -> Tuple[List[SearchResult], Dict]:
+        """GPT 분석을 기반으로 한 종합 검색 (복잡한 질문)"""
+        start_time = time.time()
+        
+        # 여러 매뉴얼에 걸친 검색이 필요한 경우
+        all_results = []
+        
+        # 각 관련 개념별로 검색
+        for concept in gpt_analysis['legal_concepts']:
+            if concept['relevance'] in ['primary', 'secondary']:
+                manual = concept['concept']
+                if manual in self.manual_indices:
+                    # 각 매뉴얼에서 관련 청크 검색
+                    partial_results = await self._search_in_manual(
+                        query, manual, concept['specific_aspects'], top_k // 2
+                    )
+                    all_results.extend(partial_results)
+        
+        # 중복 제거 및 점수 기준 정렬
+        seen_chunks = set()
+        unique_results = []
+        for result in sorted(all_results, key=lambda x: x.score, reverse=True):
+            if result.chunk_id not in seen_chunks:
+                seen_chunks.add(result.chunk_id)
+                unique_results.append(result)
+                if len(unique_results) >= top_k:
+                    break
+        
+        stats = {
+            'search_time': time.time() - start_time,
+            'searched_chunks': sum(len(self.manual_indices.get(c['concept'], [])) 
+                                 for c in gpt_analysis['legal_concepts'] 
+                                 if c['relevance'] in ['primary', 'secondary']),
+            'search_method': 'comprehensive_multi_manual'
+        }
+        
+        return unique_results, stats
+    
+    def _calculate_gpt_relevance(self, content: str, gpt_analysis: Dict) -> float:
+        """GPT 분석 결과와 청크 내용의 관련성 계산"""
+        relevance_boost = 0.0
+        content_lower = content.lower()
+        
+        # 검색 키워드 매칭
+        for keyword in gpt_analysis['search_strategy']['search_keywords']:
+            if keyword.lower() in content_lower:
+                relevance_boost += 0.1
+        
+        # 요구사항 충족 확인
+        requirements = gpt_analysis['answer_requirements']
+        if requirements.get('needs_specific_numbers') and re.search(r'\d+억|\d+%', content):
+            relevance_boost += 0.2
+        if requirements.get('needs_timeline') and re.search(r'\d+일|기한', content):
+            relevance_boost += 0.2
+        if requirements.get('needs_process_steps') and re.search(r'절차|단계|순서', content):
+            relevance_boost += 0.15
+        
+        return min(relevance_boost, 0.5)
+    
+    async def _search_in_manual(self, query: str, manual: str, aspects: List[str], 
+                               limit: int) -> List[SearchResult]:
+        """특정 매뉴얼 내에서 검색"""
+        indices = self.manual_indices.get(manual, [])[:100]
+        
+        # 측면별 키워드 추가
+        enhanced_query = f"{query} {' '.join(aspects)}"
+        query_vector = self.embedding_model.encode([enhanced_query])
+        query_vector = np.array(query_vector, dtype=np.float32)
+        
+        k_search = min(len(indices), limit * 3)
+        scores, search_indices = self.index.search(query_vector, k_search)
+        
+        results = []
+        indices_set = set(indices)
+        
+        for idx, score in zip(search_indices[0], scores[0]):
+            if idx in indices_set:
+                chunk = self.chunks[idx]
+                results.append(SearchResult(
+                    chunk_id=chunk.get('chunk_id', str(idx)),
+                    content=chunk['content'],
+                    score=float(score),
+                    source=chunk['source'],
+                    page=chunk['page'],
+                    chunk_type=chunk.get('chunk_type', 'unknown'),
+                    metadata=json.loads(chunk.get('metadata', '{}'))
+                ))
+                if len(results) >= limit:
+                    break
+        
+        return results
+    
+    def _fallback_process_query(self, query: str, top_k: int) -> Tuple[List[SearchResult], Dict]:
+        """GPT 분석 실패 시 기존 방식으로 폴백"""
+        # 기존의 규칙 기반 검색 사용
+        results, stats = self._fast_traditional_search(query, top_k)
+        stats['processing_mode'] = 'fallback_traditional'
+        stats['gpt_failure'] = True
+        return results, stats
+    
     def _fast_traditional_search(self, query: str, top_k: int) -> Tuple[List[SearchResult], Dict]:
-        """기존의 빠른 벡터 검색 방식"""
+        """기존의 빠른 벡터 검색 방식 (의도 기반 개선)"""
         start_time = time.time()
         
         # 캐시 확인
@@ -868,42 +1135,80 @@ class HybridRAGPipeline:
             stats['cache_hit'] = True
             return cached['results'], stats
         
-        # 질문 분류
+        # 질문의 핵심 의도 분석
+        intent_analysis = self.complexity_assessor.query_analyzer.extract_core_intent(query)
+        
+        # 기존 질문 분류와 의도 분석 결합
         category, cat_confidence = self.classifier.classify(query)
         
-        # 검색 인덱스 결정
+        # 의도 분석이 더 명확하면 그것을 우선
+        if intent_analysis['primary_concept'] and intent_analysis['concepts']:
+            primary_concept = intent_analysis['primary_concept']
+            if primary_concept == '대규모내부거래':
+                category = '대규모내부거래'
+                cat_confidence = 0.9
+            elif primary_concept == '현황공시':
+                category = '현황공시'
+                cat_confidence = 0.9
+            elif primary_concept == '비상장사중요사항':
+                category = '비상장사 중요사항'
+                cat_confidence = 0.9
+        
+        # 검색 인덱스 결정 (의도 기반 타겟팅)
         if category and cat_confidence > 0.3:
             primary_indices = self.manual_indices.get(category, [])
+            
+            # 의도 분석을 통한 추가 필터링
+            if intent_analysis['requirements']:
+                # 특정 요구사항에 따라 더 정밀한 타겟팅
+                if 'amount_info' in intent_analysis['requirements']:
+                    # 금액 관련 정보가 있는 청크 우선
+                    primary_indices = [idx for idx in primary_indices 
+                                     if '억' in self.chunks[idx]['content'] or 
+                                        '%' in self.chunks[idx]['content']]
+                elif 'timeline_info' in intent_analysis['requirements']:
+                    # 기한 관련 정보가 있는 청크 우선
+                    primary_indices = [idx for idx in primary_indices 
+                                     if '일' in self.chunks[idx]['content'] or 
+                                        '기한' in self.chunks[idx]['content']]
+            
+            # 검색 대상 제한
+            if len(primary_indices) > 200:
+                primary_indices = primary_indices[:200]
             secondary_indices = []
-            for cat, indices in self.manual_indices.items():
-                if cat != category and cat != '기타':
-                    secondary_indices.extend(indices)
         else:
-            primary_indices = list(range(len(self.chunks)))
+            # 전체 검색도 제한
+            primary_indices = list(range(min(len(self.chunks), 300)))
             secondary_indices = []
         
-        # 벡터 검색
-        query_vector = self.embedding_model.encode([query])
+        # 벡터 검색 (의도 분석을 반영한 쿼리 개선)
+        enhanced_query = self._enhance_query_with_intent(query, intent_analysis)
+        query_vector = self.embedding_model.encode([enhanced_query])
         query_vector = np.array(query_vector, dtype=np.float32)
         
-        k_search = min(len(self.chunks), top_k * 10)
+        k_search = min(len(primary_indices), top_k * 5)
         scores, indices = self.index.search(query_vector, k_search)
         
-        # 결과 수집
+        # 결과 수집 및 의도 기반 재정렬
         results = []
         seen_chunks = set()
         
-        # 우선순위 인덱스에서 결과 수집
         if primary_indices:
             primary_set = set(primary_indices)
             for idx, score in zip(indices[0], scores[0]):
                 if idx in primary_set and idx not in seen_chunks:
                     seen_chunks.add(idx)
                     chunk = self.chunks[idx]
+                    
+                    # 의도와의 관련성 점수 보정
+                    relevance_boost = self._calculate_intent_relevance(
+                        chunk['content'], intent_analysis
+                    )
+                    
                     result = SearchResult(
                         chunk_id=chunk.get('chunk_id', str(idx)),
                         content=chunk['content'],
-                        score=float(score),
+                        score=float(score) * (1 + relevance_boost),
                         source=chunk['source'],
                         page=chunk['page'],
                         chunk_type=chunk.get('chunk_type', 'unknown'),
@@ -913,22 +1218,77 @@ class HybridRAGPipeline:
                     if len(results) >= top_k:
                         break
         
+        # 의도 기반 재정렬
+        results.sort(key=lambda x: x.score, reverse=True)
+        
         # 통계
         stats = {
             'search_time': time.time() - start_time,
             'category': category,
             'category_confidence': cat_confidence,
-            'cache_hit': False
+            'cache_hit': False,
+            'searched_chunks': len(primary_indices),
+            'intent_analysis': intent_analysis,
+            'search_method': 'intent_enhanced'
         }
         
-        # 캐시 저장
-        if stats['search_time'] < 1.0:
+        # 캐시 저장 (빠른 검색만)
+        if stats['search_time'] < 0.5 and len(self.search_cache) < self.cache_max_size:
             self.search_cache[cache_key] = {
                 'results': results,
-                'stats': stats
+                'stats': stats,
+                'timestamp': time.time()
             }
         
         return results, stats
+    
+    def _enhance_query_with_intent(self, original_query: str, intent_analysis: Dict) -> str:
+        """의도 분석을 바탕으로 검색 쿼리 개선"""
+        enhanced_parts = [original_query]
+        
+        # 핵심 개념 추가
+        if intent_analysis['primary_concept']:
+            enhanced_parts.append(intent_analysis['primary_concept'])
+        
+        # 질문 유형에 따른 키워드 추가
+        if intent_analysis['question_type'] == 'amount_criteria':
+            enhanced_parts.extend(['금액 기준', '이상', '초과'])
+        elif intent_analysis['question_type'] == 'timeline':
+            enhanced_parts.extend(['기한', '일 이내', '공시'])
+        elif intent_analysis['question_type'] == 'process':
+            enhanced_parts.extend(['절차', '방법', '순서'])
+        
+        return ' '.join(enhanced_parts)
+    
+    def _calculate_intent_relevance(self, content: str, intent_analysis: Dict) -> float:
+        """청크 내용과 의도의 관련성 계산"""
+        relevance_boost = 0.0
+        content_lower = content.lower()
+        
+        # 핵심 개념 포함 여부
+        if intent_analysis['primary_concept']:
+            if intent_analysis['primary_concept'].lower() in content_lower:
+                relevance_boost += 0.3
+        
+        # 요구사항 충족 여부
+        for req in intent_analysis['requirements']:
+            if req == 'amount_info' and re.search(r'\d+억|%', content):
+                relevance_boost += 0.2
+            elif req == 'timeline_info' and re.search(r'\d+일|기한', content):
+                relevance_boost += 0.2
+            elif req == 'process_info' and any(word in content_lower for word in ['절차', '순서', '단계']):
+                relevance_boost += 0.2
+            elif req == 'disclosure_info' and '공시' in content_lower:
+                relevance_boost += 0.2
+        
+        # 매칭된 트리거 키워드 수
+        if intent_analysis['concepts']:
+            for concept in intent_analysis['concepts']:
+                matched_count = sum(1 for trigger in concept['matched_triggers'] 
+                                  if trigger in content_lower)
+                relevance_boost += matched_count * 0.05
+        
+        return min(relevance_boost, 1.0)  # 최대 100% 부스트
     
     def _gpt_enhance_results(self, query: str, initial_results: List[SearchResult], 
                            top_k: int) -> Tuple[List[SearchResult], Dict]:
@@ -1223,10 +1583,12 @@ def main():
                 # 전체 시간 측정 시작
                 total_start_time = time.time()
                 
-                # 하이브리드 검색 수행
+                # GPT-4o 기반 하이브리드 검색 수행
                 search_start_time = time.time()
-                with st.spinner("🔍 최적의 검색 방식을 선택하여 자료를 검색하는 중..."):
-                    results, stats = rag.process_query(prompt, top_k=5)
+                with st.spinner("🔍 GPT-4o가 질문을 분석하고 최적의 검색 전략을 수립하는 중..."):
+                    # 비동기 함수를 동기적으로 실행
+                    import asyncio
+                    results, stats = asyncio.run(rag.process_query(prompt, top_k=5))
                 search_time = time.time() - search_start_time
                 
                 # 답변 생성
