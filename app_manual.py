@@ -1383,7 +1383,7 @@ def main():
     st.markdown("""
     <div class="main-header">
         <h1>⚖️ 전략기획부 AI 법률 보조원</h1>
-        <p>공정거래위원회 규정 및 매뉴얼 기반 GPT-4o 통합 Q&A 시스템</p>
+        <p>공정거래위원회 규정 및 매뉴얼 기반 AI Q&A 시스템</p>
     </div>
     """, unsafe_allow_html=True)
     
