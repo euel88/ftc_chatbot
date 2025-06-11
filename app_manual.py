@@ -121,6 +121,16 @@ class SearchResult:
     page: int
     chunk_type: str
     metadata: Dict
+    
+    @property
+    def document_date(self) -> Optional[str]:
+        """문서의 작성/개정 날짜 반환"""
+        return self.metadata.get('document_date') or self.metadata.get('revision_date')
+    
+    @property
+    def is_latest(self) -> bool:
+        """최신 자료 여부 확인"""
+        return self.metadata.get('is_latest', False)
 
 class QueryComplexity(Enum):
     """질문 복잡도 레벨"""
@@ -128,7 +138,194 @@ class QueryComplexity(Enum):
     MEDIUM = "medium"      # 중간 복잡도
     COMPLEX = "complex"    # 복잡한 분석 필요
 
-# ===== 3. 질문 복잡도 평가기 (새로운 기능) =====
+# ===== 3. 문서 버전 관리 및 최신성 검증 시스템 (새로운 기능) =====
+class DocumentVersionManager:
+    """문서의 버전과 최신성을 관리하는 시스템"""
+    
+    def __init__(self):
+        # 중요 법규 변경사항 데이터베이스
+        self.regulation_changes = {
+            '대규모내부거래_금액기준': [
+                {'date': '2023-01-01', 'old_value': '50억원', 'new_value': '100억원',
+                 'description': '자본금 및 자본총계 중 큰 금액의 5% 이상 또는 100억원 이상'},
+                {'date': '2020-01-01', 'old_value': '30억원', 'new_value': '50억원',
+                 'description': '자본금 및 자본총계 중 큰 금액의 5% 이상 또는 50억원 이상'}
+            ],
+            '공시_기한': [
+                {'date': '2022-07-01', 'old_value': '7일', 'new_value': '5일',
+                 'description': '이사회 의결 후 공시 기한 단축'}
+            ]
+        }
+        
+        # 핵심 수치 패턴 (정규표현식)
+        self.critical_patterns = {
+            '금액': r'(\d+)억\s*원',
+            '비율': r'(\d+(?:\.\d+)?)\s*%',
+            '기한': r'(\d+)\s*일',
+            '날짜': r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일'
+        }
+    
+    def extract_document_date(self, chunk: Dict) -> Optional[str]:
+        """문서에서 작성/개정 날짜 추출"""
+        content = chunk.get('content', '')
+        metadata = json.loads(chunk.get('metadata', '{}'))
+        
+        # 메타데이터에서 날짜 확인
+        if 'document_date' in metadata:
+            return metadata['document_date']
+        
+        # 문서 내용에서 날짜 패턴 찾기
+        date_patterns = [
+            r'(\d{4})년\s*(\d{1,2})월\s*개정',
+            r'시행일\s*:\s*(\d{4})년\s*(\d{1,2})월',
+            r'(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})',
+        ]
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, content)
+            if match:
+                return self._normalize_date(match.group(0))
+        
+        return None
+    
+    def _normalize_date(self, date_str: str) -> str:
+        """날짜 문자열을 표준 형식으로 변환"""
+        # 간단한 정규화 (실제로는 더 정교한 처리 필요)
+        date_str = re.sub(r'[^\d]', '-', date_str)
+        parts = date_str.split('-')
+        if len(parts) >= 2:
+            year = parts[0] if len(parts[0]) == 4 else '20' + parts[0]
+            month = parts[1].zfill(2)
+            day = parts[2].zfill(2) if len(parts) > 2 else '01'
+            return f"{year}-{month}-{day}"
+        return None
+    
+    def check_for_outdated_info(self, content: str, document_date: str = None) -> List[Dict]:
+        """구버전 정보가 포함되어 있는지 확인"""
+        warnings = []
+        
+        # 대규모내부거래 금액 기준 확인
+        amount_match = re.search(r'(\d+)억\s*원.*대규모내부거래', content)
+        if amount_match:
+            amount = int(amount_match.group(1))
+            if amount == 50:
+                warnings.append({
+                    'type': 'outdated_amount',
+                    'found': '50억원',
+                    'current': '100억원',
+                    'regulation': '대규모내부거래 금액 기준',
+                    'changed_date': '2023-01-01',
+                    'severity': 'critical'
+                })
+            elif amount == 30:
+                warnings.append({
+                    'type': 'outdated_amount',
+                    'found': '30억원',
+                    'current': '100억원',
+                    'regulation': '대규모내부거래 금액 기준',
+                    'changed_date': '2023-01-01',
+                    'severity': 'critical'
+                })
+        
+        return warnings
+
+class ConflictResolver:
+    """상충하는 정보를 해결하는 시스템"""
+    
+    def __init__(self, version_manager: DocumentVersionManager):
+        self.version_manager = version_manager
+    
+    def resolve_conflicts(self, results: List[SearchResult], query: str) -> List[SearchResult]:
+        """검색 결과 중 상충하는 정보를 해결하고 최신 정보를 우선시"""
+        
+        # 1. 각 결과의 날짜와 구버전 정보 확인
+        for result in results:
+            doc_date = result.document_date
+            warnings = self.version_manager.check_for_outdated_info(result.content, doc_date)
+            
+            # 메타데이터에 경고 추가
+            if warnings:
+                result.metadata['warnings'] = warnings
+                result.metadata['has_outdated_info'] = True
+            else:
+                result.metadata['has_outdated_info'] = False
+        
+        # 2. 중요 수치에 대한 충돌 검사
+        critical_info = self._extract_critical_info(results, query)
+        if critical_info:
+            conflicts = self._find_conflicts(critical_info)
+            if conflicts:
+                results = self._prioritize_latest_info(results, conflicts)
+        
+        # 3. 최신 정보를 포함한 결과를 상위로 재정렬
+        results.sort(key=lambda r: (
+            not r.metadata.get('has_outdated_info', False),  # 구버전 정보가 없는 것 우선
+            r.document_date or '1900-01-01',  # 최신 문서 우선
+            r.score  # 원래 점수
+        ), reverse=True)
+        
+        return results
+    
+    def _extract_critical_info(self, results: List[SearchResult], query: str) -> Dict:
+        """결과에서 중요 정보 추출"""
+        critical_info = defaultdict(list)
+        
+        for i, result in enumerate(results):
+            # 금액 정보 추출
+            amounts = re.findall(r'(\d+)억\s*원', result.content)
+            for amount in amounts:
+                critical_info['amounts'].append({
+                    'value': amount + '억원',
+                    'result_index': i,
+                    'context': result.content[:100]
+                })
+            
+            # 비율 정보 추출
+            percentages = re.findall(r'(\d+(?:\.\d+)?)\s*%', result.content)
+            for pct in percentages:
+                critical_info['percentages'].append({
+                    'value': pct + '%',
+                    'result_index': i,
+                    'context': result.content[:100]
+                })
+        
+        return dict(critical_info)
+    
+    def _find_conflicts(self, critical_info: Dict) -> List[Dict]:
+        """중요 정보 간 충돌 찾기"""
+        conflicts = []
+        
+        # 금액 충돌 확인 (예: 50억 vs 100억)
+        if 'amounts' in critical_info:
+            amount_values = set()
+            for item in critical_info['amounts']:
+                if '대규모내부거래' in item['context']:
+                    amount_values.add(item['value'])
+            
+            if len(amount_values) > 1 and ('50억원' in amount_values or '30억원' in amount_values):
+                conflicts.append({
+                    'type': 'amount_conflict',
+                    'values': list(amount_values),
+                    'correct_value': '100억원'
+                })
+        
+        return conflicts
+    
+    def _prioritize_latest_info(self, results: List[SearchResult], conflicts: List[Dict]) -> List[SearchResult]:
+        """충돌이 있을 때 최신 정보를 우선시"""
+        # 구버전 정보를 포함한 결과의 점수를 낮춤
+        for conflict in conflicts:
+            if conflict['type'] == 'amount_conflict':
+                for i, result in enumerate(results):
+                    if any(old_val in result.content for old_val in ['50억원', '30억원']):
+                        # 구버전 정보를 포함한 결과의 점수를 50% 감소
+                        results[i].score *= 0.5
+                        results[i].metadata['score_reduced'] = True
+                        results[i].metadata['reduction_reason'] = 'outdated_amount'
+        
+        return results
+
+# ===== 3-1. 질문 복잡도 평가기 (기존 코드) =====
 class ComplexityAssessor:
     """질문의 복잡도를 평가하여 처리 방식을 결정"""
     
@@ -471,6 +668,10 @@ class HybridRAGPipeline:
         self.complexity_assessor = ComplexityAssessor()
         self.gpt_search = GPTIntegratedSearch(chunks)
         
+        # 버전 관리 및 충돌 해결 시스템 초기화
+        self.version_manager = DocumentVersionManager()
+        self.conflict_resolver = ConflictResolver(self.version_manager)
+        
         # 매뉴얼별 청크 인덱스 미리 구축
         self.manual_indices = self._build_manual_indices()
         
@@ -478,6 +679,18 @@ class HybridRAGPipeline:
         self.search_cache = {}
         self.cache_max_size = 100
         
+        # 각 청크의 날짜 정보 추출 및 저장
+        self._extract_chunk_dates()
+        
+    def _extract_chunk_dates(self):
+        """모든 청크의 날짜 정보를 미리 추출"""
+        for chunk in self.chunks:
+            doc_date = self.version_manager.extract_document_date(chunk)
+            if doc_date:
+                metadata = json.loads(chunk.get('metadata', '{}'))
+                metadata['document_date'] = doc_date
+                chunk['metadata'] = json.dumps(metadata)
+    
     def _build_manual_indices(self) -> Dict[str, List[int]]:
         """각 매뉴얼별로 청크 인덱스를 미리 구축"""
         indices = defaultdict(list)
@@ -520,10 +733,21 @@ class HybridRAGPipeline:
             stats['processing_mode'] = 'hybrid'
             stats['initial_search_time'] = initial_stats['search_time']
         
-        # 3. 복잡도 정보 추가
+        # 3. 최신성 검증 및 충돌 해결
+        results = self.conflict_resolver.resolve_conflicts(results, query)
+        
+        # 4. 구버전 정보 경고 수집
+        outdated_warnings = []
+        for result in results:
+            if result.metadata.get('has_outdated_info'):
+                outdated_warnings.extend(result.metadata.get('warnings', []))
+        
+        # 5. 복잡도 정보 추가
         stats['complexity'] = complexity.value
         stats['complexity_confidence'] = confidence
         stats['complexity_analysis'] = complexity_analysis
+        stats['outdated_warnings'] = outdated_warnings
+        stats['has_version_conflicts'] = len(outdated_warnings) > 0
         
         return results, stats
     
@@ -687,17 +911,38 @@ def determine_temperature(query: str, complexity: QueryComplexity) -> float:
     return temp
 
 def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str:
-    """GPT-4o를 활용한 고품질 답변 생성"""
+    """GPT-4o를 활용한 고품질 답변 생성 (최신 정보 우선)"""
     
-    # 컨텍스트 구성
+    # 구버전 정보 경고 확인
+    has_outdated = stats.get('has_version_conflicts', False)
+    outdated_warnings = stats.get('outdated_warnings', [])
+    
+    # 컨텍스트 구성 (최신 정보 우선)
     context_parts = []
+    latest_info_parts = []
+    outdated_info_parts = []
+    
     for i, result in enumerate(results[:5]):
-        context_parts.append(f"""
+        context_str = f"""
 [참고 {i+1}] {result.source} (페이지 {result.page})
 {result.content}
-""")
+"""
+        if result.metadata.get('has_outdated_info'):
+            outdated_info_parts.append(context_str)
+        else:
+            latest_info_parts.append(context_str)
     
+    # 최신 정보를 먼저, 구버전 정보는 나중에
+    context_parts = latest_info_parts + outdated_info_parts
     context = "\n---\n".join(context_parts)
+    
+    # 중요 법규 변경사항 명시
+    critical_updates = ""
+    if has_outdated:
+        critical_updates = "\n\n[중요 법규 변경사항]"
+        for warning in outdated_warnings:
+            if warning['severity'] == 'critical':
+                critical_updates += f"\n- {warning['regulation']}: {warning['found']} → {warning['current']} (변경일: {warning['changed_date']})"
     
     # 복잡도 정보 활용
     complexity = QueryComplexity(stats.get('complexity', 'medium'))
@@ -717,7 +962,7 @@ def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str
     category = stats.get('category')
     if category:
         category_instructions = {
-            '대규모내부거래': "특히 이사회 의결 요건, 공시 기한, 면제 조건을 명확히 설명하세요.",
+            '대규모내부거래': "특히 이사회 의결 요건, 공시 기한, 면제 조건을 명확히 설명하세요. 금액 기준은 반드시 최신 기준(100억원 이상 또는 자본금 및 자본총계 중 큰 금액의 5% 이상)을 사용하세요.",
             '현황공시': "공시 주체, 시기, 제출 서류를 구체적으로 안내하세요.",
             '비상장사 중요사항': "공시 대상 거래, 기한, 제출 방법을 상세히 설명하세요."
         }
@@ -730,10 +975,14 @@ def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str
 질문 복잡도: {complexity.value}
 처리 방식: {mode}
 
+중요: 법규가 변경된 경우 반드시 최신 정보를 기준으로 답변하세요. 
+특히 대규모내부거래 금액 기준은 2023년부터 100억원 이상으로 변경되었습니다.
+
 답변은 다음 구조를 따라주세요:
-1. 핵심 답변 (1-2문장)
+1. 핵심 답변 (1-2문장) - 최신 법규 기준
 2. 상세 설명 (근거 조항 포함)
 3. 주의사항 또는 예외사항 (있는 경우)
+4. 법규 변경사항 (중요한 변경이 있었던 경우)
 
 {extra_instruction}"""
     
@@ -741,6 +990,7 @@ def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"""다음 자료를 바탕으로 질문에 답변해주세요.
+{critical_updates}
 
 [참고 자료]
 {context}
@@ -748,7 +998,8 @@ def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str
 [질문]
 {query}
 
-{"간결하고 명확하게" if complexity == QueryComplexity.SIMPLE else "상세하고 실무적으로"} 답변해주세요."""}
+{"간결하고 명확하게" if complexity == QueryComplexity.SIMPLE else "상세하고 실무적으로"} 답변해주세요.
+구버전 정보와 최신 정보가 상충하는 경우, 반드시 최신 정보를 기준으로 답변하세요."""}
     ]
     
     response = openai.chat.completions.create(
@@ -902,6 +1153,19 @@ def main():
                 
                 # 성능 분석 (접을 수 있게)
                 with st.expander("🔍 상세 정보 보기"):
+                    # 구버전 정보 경고 표시
+                    if stats.get('has_version_conflicts'):
+                        st.error("⚠️ **중요: 법규 변경사항 발견**")
+                        for warning in stats.get('outdated_warnings', []):
+                            if warning['severity'] == 'critical':
+                                st.warning(f"""
+                                📌 **{warning['regulation']}** 변경
+                                - 이전: {warning['found']}
+                                - 현재: **{warning['current']}** ✅
+                                - 변경일: {warning['changed_date']}
+                                """)
+                        st.info("💡 본 시스템은 최신 법규를 기준으로 답변을 제공합니다.")
+                    
                     # 처리 방식 설명
                     mode_descriptions = {
                         'fast_traditional': "빠른 벡터 검색을 사용하여 신속하게 처리했습니다.",
@@ -932,9 +1196,26 @@ def main():
                     # 참고 자료
                     st.subheader("📚 참고 자료")
                     for i, result in enumerate(results[:3]):
-                        st.caption(f"**{result.source}** - 페이지 {result.page} (관련도: {result.score:.2f})")
+                        # 구버전 정보 표시
+                        version_indicator = ""
+                        if result.metadata.get('has_outdated_info'):
+                            version_indicator = " ⚠️ **[구버전 정보 포함]**"
+                        
+                        st.caption(f"**{result.source}** - 페이지 {result.page} (관련도: {result.score:.2f}){version_indicator}")
+                        
+                        # 문서 날짜 표시
+                        if result.document_date:
+                            st.caption(f"📅 문서 날짜: {result.document_date}")
+                        
                         with st.container():
-                            st.text(result.content[:300] + "..." if len(result.content) > 300 else result.content)
+                            # 내용 표시 (구버전 정보는 취소선 처리)
+                            content = result.content[:300] + "..." if len(result.content) > 300 else result.content
+                            
+                            # 50억원이나 30억원이 포함된 경우 하이라이트
+                            if '50억원' in content or '30억원' in content:
+                                content = re.sub(r'(50억원|30억원)', r'~~\1~~ → **100억원**', content)
+                            
+                            st.text(content)
                     
                     # 성능 평가
                     if total_time < 3:
