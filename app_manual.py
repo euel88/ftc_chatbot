@@ -180,12 +180,89 @@ def load_models_and_data():
     """모델과 데이터를 효율적으로 로드"""
     with st.spinner("🔧 AI 시스템을 초기화하는 중..."):
         try:
-            # 모델 로드
-            embedding_model = SentenceTransformer('jhgan/ko-sroberta-multitask')
-            reranker_model = CrossEncoder('Dongjin-kr/ko-reranker')
+            # 환경 확인 (로컬인지 클라우드인지)
+            is_cloud = os.environ.get('STREAMLIT_CLOUD', 'false').lower() == 'true'
+            
+            # 필수 파일 존재 여부 먼저 확인
+            if not os.path.exists("manuals_vector_db.index"):
+                st.error("❌ 벡터 데이터베이스 파일을 찾을 수 없습니다.")
+                st.info("💡 먼저 prepare_pdfs_ftc.py를 실행하여 데이터를 준비하세요.")
+                return None, None, None, None, None
+                
+            if not os.path.exists("all_manual_chunks.json"):
+                st.error("❌ 청크 데이터 파일을 찾을 수 없습니다.")
+                return None, None, None, None, None
+            
+            # 임베딩 모델 로드
+            embedding_model = None
+            
+            # Streamlit Cloud 환경에서는 항상 온라인 모델 사용
+            if is_cloud:
+                st.info("☁️ 클라우드 환경에서 실행 중입니다. 온라인 모델을 로드합니다...")
+                try:
+                    # 주의: 이 모델은 prepare_pdfs_ftc.py에서 사용한 것과 동일해야 함
+                    embedding_model = SentenceTransformer('jhgan/ko-sroberta-multitask')
+                    st.success("✅ 한국어 임베딩 모델 로드 성공!")
+                except Exception as e:
+                    st.warning(f"⚠️ 한국어 모델 로드 실패: {str(e)}")
+                    st.info("🔄 대체 다국어 모델을 사용합니다...")
+                    try:
+                        # 대체 모델 (prepare_pdfs에서도 같은 대체 모델을 사용해야 함)
+                        embedding_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+                        st.warning("⚠️ 주의: 대체 모델을 사용 중입니다. 검색 정확도가 낮을 수 있습니다.")
+                    except Exception as e:
+                        st.error(f"❌ 모든 임베딩 모델 로드 실패: {str(e)}")
+                        return None, None, None, None, None
+            
+            # 로컬 환경에서는 로컬 모델 우선 시도
+            else:
+                # 로컬 모델 경로
+                local_model_path = r"C:\Users\OK\Desktop\파이썬 코드 모음\챗봇_공정위 기업집단 관련\models\ko-sroberta-multitask"
+                
+                # 상대 경로로도 시도
+                if not os.path.exists(local_model_path):
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    local_model_path = os.path.join(script_dir, "models", "ko-sroberta-multitask")
+                
+                # 로컬 모델 로드 시도
+                if os.path.exists(local_model_path):
+                    try:
+                        st.info("💻 로컬 환경: 저장된 모델을 사용합니다...")
+                        embedding_model = SentenceTransformer(local_model_path)
+                        st.success("✅ 로컬 모델 로드 성공!")
+                    except Exception as e:
+                        st.warning(f"⚠️ 로컬 모델 로드 실패: {str(e)}")
+                
+                # 로컬 모델이 없으면 온라인 모델 시도
+                if embedding_model is None:
+                    try:
+                        st.info("🌐 온라인에서 모델을 다운로드합니다...")
+                        # SSL 오류 방지 (로컬 환경에서만)
+                        import ssl
+                        ssl._create_default_https_context = ssl._create_unverified_context
+                        os.environ['HF_HUB_DISABLE_SSL_VERIFY'] = '1'
+                        
+                        embedding_model = SentenceTransformer('jhgan/ko-sroberta-multitask')
+                        st.success("✅ 온라인 모델 로드 성공!")
+                    except Exception as e:
+                        st.error(f"❌ 임베딩 모델 로드 실패: {str(e)}")
+                        return None, None, None, None, None
+            
+            # CrossEncoder 모델 로드 (재정렬용)
+            try:
+                reranker_model = CrossEncoder('Dongjin-kr/ko-reranker')
+            except:
+                st.warning("⚠️ 한국어 재정렬 모델 로드 실패. 기본 재정렬 모델을 사용합니다.")
+                try:
+                    # 대체 재정렬 모델
+                    reranker_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+                except:
+                    st.warning("⚠️ 재정렬 모델을 사용할 수 없습니다. 기본 검색만 수행합니다.")
+                    reranker_model = None
             
             # 인덱스와 데이터 로드
             index = faiss.read_index("manuals_vector_db.index")
+            
             with open("all_manual_chunks.json", "r", encoding="utf-8") as f:
                 chunks_data = json.load(f)
             
@@ -194,10 +271,32 @@ def load_models_and_data():
             for idx, chunk in enumerate(chunks_data):
                 chunk_type_index[chunk.get('chunk_type', 'unknown')].append(idx)
             
+            # 시스템 정보 표시
+            st.success(f"✅ 시스템 준비 완료!")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("총 정보 단위", f"{len(chunks_data):,}개")
+            with col2:
+                st.metric("벡터 차원", f"{index.d}")
+            with col3:
+                env_type = "☁️ 클라우드" if is_cloud else "💻 로컬"
+                st.metric("실행 환경", env_type)
+            
             return embedding_model, reranker_model, index, chunks_data, chunk_type_index
             
         except Exception as e:
-            st.error(f"❌ 데이터 로드 실패: {str(e)}")
+            st.error(f"❌ 시스템 초기화 실패: {str(e)}")
+            st.info("💡 문제 해결 방법:")
+            st.info("1. prepare_pdfs_ftc.py를 먼저 실행했는지 확인하세요")
+            st.info("2. 생성된 파일들이 GitHub에 제대로 업로드되었는지 확인하세요")
+            st.info("3. requirements.txt에 필요한 패키지가 모두 포함되었는지 확인하세요")
+            
+            # 디버깅 정보
+            with st.expander("🔍 디버깅 정보"):
+                st.write("현재 디렉토리:", os.getcwd())
+                st.write("파일 목록:", os.listdir('.'))
+                st.write("환경 변수 STREAMLIT_CLOUD:", os.environ.get('STREAMLIT_CLOUD', 'Not set'))
+            
             return None, None, None, None, None
 
 # --- 4. 고급 RAG 파이프라인 ---
