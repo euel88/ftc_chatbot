@@ -1,4 +1,4 @@
-# 파일 이름: app_manual.py (공정거래위원회 AI 법률 보조원 - 통합 개선 버전)
+# 파일 이름: app_hybrid_gpt.py (공정거래위원회 AI 법률 보조원 - GPT 하이브리드 통합 버전)
 
 import streamlit as st
 import faiss
@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass
 import os
 import hashlib
+from enum import Enum
 
 # ===== 1. 페이지 설정 및 스타일링 =====
 st.set_page_config(
@@ -74,6 +75,31 @@ st.markdown("""
         border-radius: 10px;
         margin-bottom: 1rem;
     }
+    
+    /* 복잡도 표시 스타일 */
+    .complexity-indicator {
+        display: inline-block;
+        padding: 4px 12px;
+        border-radius: 16px;
+        font-size: 0.85rem;
+        font-weight: 500;
+        margin-left: 8px;
+    }
+    
+    .complexity-simple {
+        background-color: #d4edda;
+        color: #155724;
+    }
+    
+    .complexity-medium {
+        background-color: #fff3cd;
+        color: #856404;
+    }
+    
+    .complexity-complex {
+        background-color: #f8d7da;
+        color: #721c24;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -96,7 +122,100 @@ class SearchResult:
     chunk_type: str
     metadata: Dict
 
-# ===== 3. 질문 분류기 (개선사항 1: 질문 유형별 맞춤 검색) =====
+class QueryComplexity(Enum):
+    """질문 복잡도 레벨"""
+    SIMPLE = "simple"      # 단순 사실 확인
+    MEDIUM = "medium"      # 중간 복잡도
+    COMPLEX = "complex"    # 복잡한 분석 필요
+
+# ===== 3. 질문 복잡도 평가기 (새로운 기능) =====
+class ComplexityAssessor:
+    """질문의 복잡도를 평가하여 처리 방식을 결정"""
+    
+    def __init__(self):
+        # 복잡도 판단 기준
+        self.simple_indicators = [
+            # 단순 사실 확인
+            r'언제', r'며칠', r'기한', r'날짜', r'금액', r'%', r'얼마',
+            r'정의[가는]?', r'무엇', r'뜻[이은]?', r'의미[가는]?'
+        ]
+        
+        self.complex_indicators = [
+            # 복잡한 분석 필요
+            r'동시에', r'여러', r'복합', r'연관', r'영향',
+            r'만[약일].*경우', r'[AB].*동시.*[CD]', r'거래.*여러',
+            r'전체적', r'종합적', r'분석', r'검토', r'평가',
+            r'리스크', r'위험', r'대응', r'전략'
+        ]
+        
+        self.medium_indicators = [
+            # 중간 복잡도
+            r'어떻게', r'방법', r'절차', r'과정',
+            r'주의', r'예외', r'특별', r'고려'
+        ]
+        
+    def assess(self, query: str) -> Tuple[QueryComplexity, float, Dict]:
+        """질문의 복잡도를 평가하고 관련 정보 반환"""
+        query_lower = query.lower()
+        
+        # 점수 계산
+        simple_score = sum(1 for pattern in self.simple_indicators 
+                         if re.search(pattern, query_lower))
+        complex_score = sum(2 for pattern in self.complex_indicators 
+                          if re.search(pattern, query_lower))
+        medium_score = sum(1.5 for pattern in self.medium_indicators 
+                         if re.search(pattern, query_lower))
+        
+        # 추가 복잡도 요인
+        # 1. 질문 길이
+        if len(query) > 100:
+            complex_score += 1
+        elif len(query) < 30:
+            simple_score += 0.5
+            
+        # 2. 특수 패턴
+        if re.search(r'[AB]회사.*[CD]회사', query_lower):
+            complex_score += 2  # 여러 회사 관련
+        if '?' in query and query.count('?') > 1:
+            complex_score += 1  # 여러 질문
+            
+        # 최종 복잡도 결정
+        total_score = simple_score + medium_score + complex_score
+        
+        if total_score == 0:
+            complexity = QueryComplexity.MEDIUM
+            confidence = 0.5
+        elif complex_score > simple_score * 2:
+            complexity = QueryComplexity.COMPLEX
+            confidence = min(complex_score / (total_score + 1), 0.9)
+        elif simple_score > complex_score * 2:
+            complexity = QueryComplexity.SIMPLE
+            confidence = min(simple_score / (total_score + 1), 0.9)
+        else:
+            complexity = QueryComplexity.MEDIUM
+            confidence = 0.6
+            
+        # 분석 정보
+        analysis = {
+            'simple_score': simple_score,
+            'medium_score': medium_score,
+            'complex_score': complex_score,
+            'query_length': len(query),
+            'estimated_cost_multiplier': self._estimate_cost_multiplier(complexity)
+        }
+        
+        return complexity, confidence, analysis
+    
+    def _estimate_cost_multiplier(self, complexity: QueryComplexity) -> float:
+        """복잡도에 따른 예상 비용 배수"""
+        multipliers = {
+            QueryComplexity.SIMPLE: 1.0,
+            QueryComplexity.MEDIUM: 3.0,
+            QueryComplexity.COMPLEX: 10.0
+        }
+        return multipliers[complexity]
+
+# ===== 4. 질문 분류기 (기존 코드 유지) =====
 class QuestionClassifier:
     """질문을 분석하여 어떤 매뉴얼을 우선 검색할지 결정"""
     
@@ -168,21 +287,194 @@ class QuestionClassifier:
         
         return None, 0.0
 
-# ===== 4. 최적화된 RAG 파이프라인 (개선사항 3, 6, 7: 속도 개선 + 캐싱) =====
-class OptimizedRAGPipeline:
-    """속도와 정확도를 극대화한 RAG 파이프라인"""
+# ===== 5. GPT 통합 검색 클래스 (새로운 기능) =====
+class GPTIntegratedSearch:
+    """GPT가 검색과 분석을 모두 담당하는 통합 검색"""
+    
+    def __init__(self, chunks: List[Dict]):
+        self.chunks = chunks
+        self.max_chunks_per_call = 50  # GPT 토큰 제한 고려
+        
+    def search_and_analyze(self, query: str, top_k: int = 5) -> Tuple[List[SearchResult], Dict]:
+        """GPT가 검색과 분석을 통합적으로 수행"""
+        start_time = time.time()
+        
+        # 1단계: GPT가 검색 전략 수립
+        search_strategy = self._develop_search_strategy(query)
+        
+        # 2단계: 청크를 배치로 나누어 GPT 평가
+        all_evaluations = []
+        for i in range(0, len(self.chunks), self.max_chunks_per_call):
+            batch = self.chunks[i:i + self.max_chunks_per_call]
+            evaluations = self._evaluate_chunks_batch(query, batch, search_strategy)
+            all_evaluations.extend(evaluations)
+        
+        # 3단계: 상위 결과 선택 및 재정렬
+        all_evaluations.sort(key=lambda x: x['relevance_score'], reverse=True)
+        top_results = all_evaluations[:top_k * 2]  # 여유있게 선택
+        
+        # 4단계: GPT가 최종 순위 결정
+        final_results = self._finalize_ranking(query, top_results, top_k)
+        
+        # 통계 생성
+        stats = {
+            'method': 'gpt_integrated',
+            'search_time': time.time() - start_time,
+            'chunks_evaluated': len(self.chunks),
+            'strategy': search_strategy,
+            'estimated_cost': self._estimate_cost(len(self.chunks))
+        }
+        
+        return final_results, stats
+    
+    def _develop_search_strategy(self, query: str) -> Dict:
+        """GPT가 검색 전략을 수립"""
+        prompt = f"""
+        다음 법률 질문을 분석하여 검색 전략을 수립하세요:
+        
+        질문: {query}
+        
+        다음을 JSON 형식으로 응답하세요:
+        {{
+            "key_concepts": ["핵심 개념들"],
+            "related_concepts": ["관련 개념들"],
+            "legal_areas": ["관련 법률 영역"],
+            "search_focus": "검색 초점 설명"
+        }}
+        """
+        
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+        
+        return json.loads(response.choices[0].message.content)
+    
+    def _evaluate_chunks_batch(self, query: str, chunks: List[Dict], strategy: Dict) -> List[Dict]:
+        """GPT가 청크 배치의 관련성을 평가"""
+        # 청크 요약 생성
+        chunks_summary = "\n".join([
+            f"[청크 {i}] ({chunk['source']}, p.{chunk['page']}): {chunk['content'][:150]}..."
+            for i, chunk in enumerate(chunks)
+        ])
+        
+        prompt = f"""
+        질문: {query}
+        검색 전략: {json.dumps(strategy, ensure_ascii=False)}
+        
+        다음 문서 청크들의 관련성을 평가하세요.
+        각 청크에 대해 0-10점의 관련성 점수와 이유를 제공하세요.
+        
+        {chunks_summary}
+        
+        JSON 배열 형식으로 응답하세요:
+        [
+            {{"chunk_index": 0, "relevance_score": 8.5, "reason": "관련성 이유"}},
+            ...
+        ]
+        """
+        
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=2000,
+            response_format={"type": "json_object"}
+        )
+        
+        evaluations = json.loads(response.choices[0].message.content)
+        
+        # 원본 청크 정보와 병합
+        results = []
+        for eval_item in evaluations.get('evaluations', evaluations):
+            idx = eval_item['chunk_index']
+            if idx < len(chunks):
+                chunk = chunks[idx]
+                results.append({
+                    'chunk': chunk,
+                    'relevance_score': eval_item['relevance_score'],
+                    'reason': eval_item.get('reason', '')
+                })
+        
+        return results
+    
+    def _finalize_ranking(self, query: str, candidates: List[Dict], top_k: int) -> List[SearchResult]:
+        """GPT가 최종 순위를 결정"""
+        # 후보 요약
+        candidates_summary = "\n".join([
+            f"[후보 {i}] (점수: {c['relevance_score']:.1f}) {c['chunk']['source']}: {c['chunk']['content'][:100]}..."
+            for i, c in enumerate(candidates[:10])
+        ])
+        
+        prompt = f"""
+        질문: {query}
+        
+        다음 후보들 중에서 가장 관련성 높은 {top_k}개를 선택하고 순위를 매기세요.
+        법적 정확성과 실무적 유용성을 모두 고려하세요.
+        
+        {candidates_summary}
+        
+        선택한 후보의 인덱스를 순서대로 나열하세요: [0, 3, 1, ...]
+        """
+        
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
+        )
+        
+        # 응답에서 인덱스 추출
+        content = response.choices[0].message.content
+        indices = re.findall(r'\d+', content)[:top_k]
+        
+        # SearchResult 객체 생성
+        results = []
+        for idx_str in indices:
+            idx = int(idx_str)
+            if idx < len(candidates):
+                candidate = candidates[idx]
+                chunk = candidate['chunk']
+                results.append(SearchResult(
+                    chunk_id=chunk.get('chunk_id', str(idx)),
+                    content=chunk['content'],
+                    score=candidate['relevance_score'],
+                    source=chunk['source'],
+                    page=chunk['page'],
+                    chunk_type=chunk.get('chunk_type', 'unknown'),
+                    metadata=json.loads(chunk.get('metadata', '{}'))
+                ))
+        
+        return results
+    
+    def _estimate_cost(self, num_chunks: int) -> float:
+        """예상 비용 계산 (달러)"""
+        # GPT-4o 가격 기준 (대략적)
+        tokens_per_chunk = 200
+        total_tokens = num_chunks * tokens_per_chunk
+        price_per_1k_tokens = 0.01
+        return (total_tokens / 1000) * price_per_1k_tokens
+
+# ===== 6. 하이브리드 RAG 파이프라인 (핵심 통합) =====
+class HybridRAGPipeline:
+    """복잡도에 따라 전통적 방식과 GPT 통합 방식을 선택하는 하이브리드 파이프라인"""
     
     def __init__(self, embedding_model, reranker_model, index, chunks):
         self.embedding_model = embedding_model
         self.reranker_model = reranker_model
         self.index = index
         self.chunks = chunks
-        self.classifier = QuestionClassifier()
         
-        # 매뉴얼별 청크 인덱스 미리 구축 (빠른 필터링)
+        # 컴포넌트 초기화
+        self.classifier = QuestionClassifier()
+        self.complexity_assessor = ComplexityAssessor()
+        self.gpt_search = GPTIntegratedSearch(chunks)
+        
+        # 매뉴얼별 청크 인덱스 미리 구축
         self.manual_indices = self._build_manual_indices()
         
-        # 검색 결과 캐시 (개선사항 7)
+        # 검색 결과 캐시
         self.search_cache = {}
         self.cache_max_size = 100
         
@@ -193,7 +485,6 @@ class OptimizedRAGPipeline:
         for idx, chunk in enumerate(self.chunks):
             source = chunk.get('source', '').lower()
             
-            # 카테고리별 분류
             if '대규모내부거래' in source:
                 indices['대규모내부거래'].append(idx)
             elif '현황공시' in source or '기업집단' in source:
@@ -205,77 +496,75 @@ class OptimizedRAGPipeline:
         
         return dict(indices)
     
-    def search(self, query: str, top_k: int = 5) -> Tuple[List[SearchResult], Dict]:
-        """통합 검색 파이프라인"""
+    def process_query(self, query: str, top_k: int = 5) -> Tuple[List[SearchResult], Dict]:
+        """질문 복잡도에 따라 최적의 처리 방식을 선택"""
+        # 1. 복잡도 평가
+        complexity, confidence, complexity_analysis = self.complexity_assessor.assess(query)
+        
+        # 2. 복잡도에 따른 처리
+        if complexity == QueryComplexity.SIMPLE:
+            # 단순 질문: 빠른 전통적 검색
+            results, stats = self._fast_traditional_search(query, top_k)
+            stats['processing_mode'] = 'fast_traditional'
+            
+        elif complexity == QueryComplexity.COMPLEX:
+            # 복잡한 질문: GPT 통합 처리
+            results, stats = self.gpt_search.search_and_analyze(query, top_k)
+            stats['processing_mode'] = 'gpt_integrated'
+            
+        else:  # MEDIUM
+            # 중간 복잡도: 하이브리드 접근
+            # 먼저 빠른 검색으로 후보를 찾고, GPT로 정제
+            initial_results, initial_stats = self._fast_traditional_search(query, top_k * 3)
+            results, stats = self._gpt_enhance_results(query, initial_results, top_k)
+            stats['processing_mode'] = 'hybrid'
+            stats['initial_search_time'] = initial_stats['search_time']
+        
+        # 3. 복잡도 정보 추가
+        stats['complexity'] = complexity.value
+        stats['complexity_confidence'] = confidence
+        stats['complexity_analysis'] = complexity_analysis
+        
+        return results, stats
+    
+    def _fast_traditional_search(self, query: str, top_k: int) -> Tuple[List[SearchResult], Dict]:
+        """기존의 빠른 벡터 검색 방식"""
         start_time = time.time()
         
-        # 캐시 확인 (개선사항 7)
-        cache_key = hashlib.md5(f"{query}_{top_k}".encode()).hexdigest()
+        # 캐시 확인
+        cache_key = hashlib.md5(f"{query}_{top_k}_traditional".encode()).hexdigest()
         if cache_key in self.search_cache:
             cached = self.search_cache[cache_key]
             stats = cached['stats'].copy()
             stats['cache_hit'] = True
-            stats['search_time'] = 0.001
             return cached['results'], stats
         
-        # 1. 질문 분류 (개선사항 1)
-        category, confidence = self.classifier.classify(query)
+        # 질문 분류
+        category, cat_confidence = self.classifier.classify(query)
         
-        # 2. 검색 전략 결정
-        if category and confidence > 0.3:
-            search_strategy = 'targeted'
+        # 검색 인덱스 결정
+        if category and cat_confidence > 0.3:
             primary_indices = self.manual_indices.get(category, [])
             secondary_indices = []
             for cat, indices in self.manual_indices.items():
                 if cat != category and cat != '기타':
                     secondary_indices.extend(indices)
         else:
-            search_strategy = 'general'
             primary_indices = list(range(len(self.chunks)))
             secondary_indices = []
         
-        # 3. 최적화된 벡터 검색 (개선사항 3)
-        results = self._perform_optimized_search(
-            query, primary_indices, secondary_indices, top_k
-        )
-        
-        # 4. 통계 생성
-        search_time = time.time() - start_time
-        stats = {
-            'category': category,
-            'confidence': confidence,
-            'strategy': search_strategy,
-            'search_time': search_time,
-            'primary_searched': len(primary_indices),
-            'total_chunks': len(self.chunks),
-            'cache_hit': False
-        }
-        
-        # 5. 빠른 검색은 캐시에 저장
-        if search_time < 2.0 and len(self.search_cache) < self.cache_max_size:
-            self.search_cache[cache_key] = {
-                'results': results,
-                'stats': stats,
-                'timestamp': time.time()
-            }
-        
-        return results, stats
-    
-    def _perform_optimized_search(self, query: str, primary_indices: List[int], 
-                                 secondary_indices: List[int], top_k: int) -> List[SearchResult]:
-        """최적화된 FAISS 검색 (개선사항 3 핵심)"""
-        # 쿼리 벡터 생성 (한 번만!)
+        # 벡터 검색
         query_vector = self.embedding_model.encode([query])
         query_vector = np.array(query_vector, dtype=np.float32)
         
-        # FAISS 인덱스 직접 활용
-        k_search = min(len(self.chunks), top_k * 20)
+        k_search = min(len(self.chunks), top_k * 10)
         scores, indices = self.index.search(query_vector, k_search)
         
+        # 결과 수집
         results = []
         seen_chunks = set()
         
-        # 우선순위 인덱스에서 먼저 결과 수집
+        # 우선순위 인덱스에서 결과 수집
         if primary_indices:
             primary_set = set(primary_indices)
             for idx, score in zip(indices[0], scores[0]):
@@ -295,52 +584,109 @@ class OptimizedRAGPipeline:
                     if len(results) >= top_k:
                         break
         
-        # 부족하면 보조 인덱스에서 추가
-        if len(results) < top_k and secondary_indices:
-            secondary_set = set(secondary_indices)
-            for idx, score in zip(indices[0], scores[0]):
-                if idx in secondary_set and idx not in seen_chunks:
-                    seen_chunks.add(idx)
-                    chunk = self.chunks[idx]
-                    result = SearchResult(
-                        chunk_id=chunk.get('chunk_id', str(idx)),
-                        content=chunk['content'],
-                        score=float(score) * 0.8,  # 보조 결과는 점수 감소
-                        source=chunk['source'],
-                        page=chunk['page'],
-                        chunk_type=chunk.get('chunk_type', 'unknown'),
-                        metadata=json.loads(chunk.get('metadata', '{}'))
-                    )
-                    results.append(result)
-                    if len(results) >= top_k:
+        # 통계
+        stats = {
+            'search_time': time.time() - start_time,
+            'category': category,
+            'category_confidence': cat_confidence,
+            'cache_hit': False
+        }
+        
+        # 캐시 저장
+        if stats['search_time'] < 1.0:
+            self.search_cache[cache_key] = {
+                'results': results,
+                'stats': stats
+            }
+        
+        return results, stats
+    
+    def _gpt_enhance_results(self, query: str, initial_results: List[SearchResult], 
+                           top_k: int) -> Tuple[List[SearchResult], Dict]:
+        """GPT로 검색 결과를 정제하고 개선"""
+        start_time = time.time()
+        
+        # GPT에게 재정렬과 분석 요청
+        results_summary = "\n".join([
+            f"[결과 {i+1}] (점수: {r.score:.2f}) {r.source} p.{r.page}:\n{r.content[:200]}..."
+            for i, r in enumerate(initial_results[:10])
+        ])
+        
+        prompt = f"""
+        사용자 질문: {query}
+        
+        다음은 초기 검색 결과입니다. 이 중에서 질문에 가장 관련성 높은 {top_k}개를 선택하고,
+        각각이 왜 중요한지 설명해주세요.
+        
+        {results_summary}
+        
+        다음 형식으로 응답하세요:
+        1. 선택한 결과 번호들: [1, 3, 2, ...]
+        2. 각 결과가 중요한 이유
+        """
+        
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1000
+        )
+        
+        # 응답 파싱
+        content = response.choices[0].message.content
+        selected_indices = []
+        
+        # 숫자 추출
+        numbers = re.findall(r'\[([^\]]+)\]', content)
+        if numbers:
+            indices_str = numbers[0]
+            selected_indices = [int(x.strip()) - 1 for x in indices_str.split(',') 
+                              if x.strip().isdigit()]
+        
+        # 선택된 결과 반환
+        enhanced_results = []
+        for idx in selected_indices[:top_k]:
+            if 0 <= idx < len(initial_results):
+                enhanced_results.append(initial_results[idx])
+        
+        # 부족하면 원래 결과로 채우기
+        if len(enhanced_results) < top_k:
+            for result in initial_results:
+                if result not in enhanced_results:
+                    enhanced_results.append(result)
+                    if len(enhanced_results) >= top_k:
                         break
         
-        return results
+        stats = {
+            'enhancement_time': time.time() - start_time,
+            'enhanced_count': len(selected_indices)
+        }
+        
+        return enhanced_results, stats
 
-# ===== 5. 동적 Temperature 답변 생성 (개선사항 4, 5) =====
-def determine_temperature(query: str) -> float:
-    """질문 유형에 따라 최적의 temperature 결정"""
+# ===== 7. 동적 Temperature 답변 생성 (기존 코드 유지 + 개선) =====
+def determine_temperature(query: str, complexity: QueryComplexity) -> float:
+    """질문 유형과 복잡도에 따라 최적의 temperature 결정"""
     query_lower = query.lower()
     
-    # 단순 사실 확인 (낮은 temperature)
+    # 복잡도별 기본값
+    base_temps = {
+        QueryComplexity.SIMPLE: 0.1,
+        QueryComplexity.MEDIUM: 0.3,
+        QueryComplexity.COMPLEX: 0.5
+    }
+    
+    temp = base_temps[complexity]
+    
+    # 질문 유형별 조정
     if any(keyword in query_lower for keyword in ['언제', '며칠', '기한', '날짜', '금액', '%']):
-        return 0.1
-    
-    # 정의나 범위 (중간 temperature)
-    elif any(keyword in query_lower for keyword in ['정의', '범위', '포함', '해당', '의미']):
-        return 0.3
-    
-    # 복잡한 판단 (높은 temperature)
-    elif any(keyword in query_lower for keyword in ['어떻게', '경우', '만약', '예외', '가능']):
-        return 0.5
-    
-    # 전략적 조언 (더 높은 temperature)
+        temp = min(temp, 0.1)
     elif any(keyword in query_lower for keyword in ['전략', '대응', '리스크', '주의', '권장']):
-        return 0.7
+        temp = max(temp, 0.7)
     
-    return 0.3  # 기본값
+    return temp
 
-def generate_answer(query: str, results: List[SearchResult], category: str = None) -> str:
+def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str:
     """GPT-4o를 활용한 고품질 답변 생성"""
     
     # 컨텍스트 구성
@@ -353,30 +699,45 @@ def generate_answer(query: str, results: List[SearchResult], category: str = Non
     
     context = "\n---\n".join(context_parts)
     
-    # 동적 temperature 결정 (개선사항 5)
-    temperature = determine_temperature(query)
+    # 복잡도 정보 활용
+    complexity = QueryComplexity(stats.get('complexity', 'medium'))
+    temperature = determine_temperature(query, complexity)
     
-    # 카테고리별 특화 지시사항
-    category_instructions = {
-        '대규모내부거래': "특히 이사회 의결 요건, 공시 기한, 면제 조건을 명확히 설명하세요.",
-        '현황공시': "공시 주체, 시기, 제출 서류를 구체적으로 안내하세요.",
-        '비상장사 중요사항': "공시 대상 거래, 기한, 제출 방법을 상세히 설명하세요."
+    # 처리 모드별 특별 지시
+    mode_instructions = {
+        'gpt_integrated': "GPT가 심층 분석한 결과를 바탕으로 종합적인 답변을 제공하세요.",
+        'hybrid': "초기 검색 결과를 GPT가 정제한 내용을 바탕으로 답변하세요.",
+        'fast_traditional': "제공된 참고 자료를 바탕으로 간결하고 정확한 답변을 제공하세요."
     }
     
-    extra_instruction = category_instructions.get(category, "") if category else ""
+    mode = stats.get('processing_mode', 'fast_traditional')
+    extra_instruction = mode_instructions.get(mode, "")
     
-    # 시스템 프롬프트 구성
-    system_prompt = """당신은 한국 공정거래위원회 전문가입니다.
+    # 카테고리별 특화 지시사항
+    category = stats.get('category')
+    if category:
+        category_instructions = {
+            '대규모내부거래': "특히 이사회 의결 요건, 공시 기한, 면제 조건을 명확히 설명하세요.",
+            '현황공시': "공시 주체, 시기, 제출 서류를 구체적으로 안내하세요.",
+            '비상장사 중요사항': "공시 대상 거래, 기한, 제출 방법을 상세히 설명하세요."
+        }
+        extra_instruction += f"\n{category_instructions.get(category, '')}"
+    
+    # 시스템 프롬프트
+    system_prompt = f"""당신은 한국 공정거래위원회 전문가입니다.
 제공된 자료만을 근거로 정확하고 실무적인 답변을 제공하세요.
+
+질문 복잡도: {complexity.value}
+처리 방식: {mode}
+
 답변은 다음 구조를 따라주세요:
 1. 핵심 답변 (1-2문장)
 2. 상세 설명 (근거 조항 포함)
-3. 주의사항 또는 예외사항 (있는 경우)"""
+3. 주의사항 또는 예외사항 (있는 경우)
+
+{extra_instruction}"""
     
-    if temperature >= 0.5:
-        system_prompt += "\n다양한 관점과 실무적 고려사항을 포함하여 종합적으로 분석해주세요."
-    
-    # GPT-4o 호출 (개선사항 4)
+    # GPT-4o 호출
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"""다음 자료를 바탕으로 질문에 답변해주세요.
@@ -387,9 +748,7 @@ def generate_answer(query: str, results: List[SearchResult], category: str = Non
 [질문]
 {query}
 
-{extra_instruction}
-
-{"간결하고 명확하게" if temperature < 0.3 else "상세하고 실무적으로"} 답변해주세요."""}
+{"간결하고 명확하게" if complexity == QueryComplexity.SIMPLE else "상세하고 실무적으로"} 답변해주세요."""}
     ]
     
     response = openai.chat.completions.create(
@@ -401,7 +760,7 @@ def generate_answer(query: str, results: List[SearchResult], category: str = Non
     
     return response.choices[0].message.content
 
-# ===== 6. 모델 및 데이터 로딩 =====
+# ===== 8. 모델 및 데이터 로딩 =====
 @st.cache_resource(show_spinner=False)
 def load_models_and_data():
     """필요한 모델과 데이터 로드"""
@@ -441,13 +800,13 @@ def load_models_and_data():
         st.error(f"시스템 초기화 실패: {str(e)}")
         return None, None, None, None
 
-# ===== 7. 메인 UI (개선사항 2: 깔끔한 UI) =====
+# ===== 9. 메인 UI (하이브리드 시스템 반영) =====
 def main():
     # 헤더
     st.markdown("""
     <div class="main-header">
         <h1>⚖️ 전략기획부 AI 법률 보조원</h1>
-        <p>공정거래위원회 규정 및 매뉴얼 기반 전문 Q&A 시스템</p>
+        <p>공정거래위원회 규정 및 매뉴얼 기반 지능형 하이브리드 Q&A 시스템</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -458,8 +817,8 @@ def main():
     
     embedding_model, reranker_model, index, chunks = models
     
-    # RAG 시스템 초기화
-    rag = OptimizedRAGPipeline(embedding_model, reranker_model, index, chunks)
+    # 하이브리드 RAG 시스템 초기화
+    rag = HybridRAGPipeline(embedding_model, reranker_model, index, chunks)
     
     # 세션 상태 초기화
     if "messages" not in st.session_state:
@@ -479,7 +838,12 @@ def main():
                     if isinstance(message["content"], dict):
                         st.write(message["content"]["answer"])
                         
-                        # 시간 정보 표시 (개선사항 6)
+                        # 복잡도 표시
+                        complexity = message["content"].get("complexity", "unknown")
+                        complexity_html = f'<span class="complexity-indicator complexity-{complexity}">{complexity.upper()}</span>'
+                        st.markdown(f"처리 복잡도: {complexity_html}", unsafe_allow_html=True)
+                        
+                        # 시간 정보 표시
                         if "total_time" in message["content"]:
                             col1, col2, col3 = st.columns(3)
                             with col1:
@@ -500,19 +864,19 @@ def main():
             
             # AI 응답 생성
             with st.chat_message("assistant"):
-                # 전체 시간 측정 시작 (개선사항 6)
+                # 전체 시간 측정 시작
                 total_start_time = time.time()
                 
-                # 검색 수행
+                # 하이브리드 검색 수행
                 search_start_time = time.time()
-                with st.spinner("🔍 관련 자료를 검색하는 중..."):
-                    results, stats = rag.search(prompt, top_k=5)
+                with st.spinner("🔍 최적의 검색 방식을 선택하여 자료를 검색하는 중..."):
+                    results, stats = rag.process_query(prompt, top_k=5)
                 search_time = time.time() - search_start_time
                 
                 # 답변 생성
                 generation_start_time = time.time()
                 with st.spinner("💭 답변을 생성하는 중..."):
-                    answer = generate_answer(prompt, results, stats.get('category'))
+                    answer = generate_answer(prompt, results, stats)
                 generation_time = time.time() - generation_start_time
                 
                 # 전체 시간 계산
@@ -520,6 +884,12 @@ def main():
                 
                 # 답변 표시
                 st.write(answer)
+                
+                # 복잡도 표시
+                complexity = stats.get('complexity', 'unknown')
+                mode = stats.get('processing_mode', 'unknown')
+                complexity_html = f'<span class="complexity-indicator complexity-{complexity}">{complexity.upper()}</span>'
+                st.markdown(f"질문 복잡도: {complexity_html} | 처리 방식: **{mode}**", unsafe_allow_html=True)
                 
                 # 시간 정보 표시
                 col1, col2, col3 = st.columns(3)
@@ -532,18 +902,37 @@ def main():
                 
                 # 성능 분석 (접을 수 있게)
                 with st.expander("🔍 상세 정보 보기"):
+                    # 처리 방식 설명
+                    mode_descriptions = {
+                        'fast_traditional': "빠른 벡터 검색을 사용하여 신속하게 처리했습니다.",
+                        'hybrid': "초기 검색 후 GPT로 결과를 정제하여 정확도를 높였습니다.",
+                        'gpt_integrated': "GPT가 전체 과정을 담당하여 심층적으로 분석했습니다."
+                    }
+                    st.info(f"🎯 **처리 방식**: {mode_descriptions.get(mode, '알 수 없음')}")
+                    
+                    # 복잡도 분석
+                    if 'complexity_analysis' in stats:
+                        analysis = stats['complexity_analysis']
+                        st.subheader("📊 복잡도 분석")
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("단순 점수", f"{analysis['simple_score']:.1f}")
+                        with col2:
+                            st.metric("중간 점수", f"{analysis['medium_score']:.1f}")
+                        with col3:
+                            st.metric("복잡 점수", f"{analysis['complex_score']:.1f}")
+                        
+                        if mode == 'gpt_integrated':
+                            st.warning(f"💰 예상 비용: 일반 검색의 약 {analysis['estimated_cost_multiplier']:.1f}배")
+                    
                     # 검색 통계
                     if stats.get('category'):
-                        st.info(f"📂 **{stats['category']}** 카테고리로 분류 (신뢰도: {stats['confidence']:.0%})")
-                        if stats.get('cache_hit'):
-                            st.success("⚡ 캐시에서 즉시 응답!")
-                        else:
-                            st.info(f"🔍 {stats['primary_searched']}개 문서 우선 검색 (전체 {stats['total_chunks']}개 중)")
+                        st.info(f"📂 **{stats['category']}** 카테고리로 분류 (신뢰도: {stats.get('category_confidence', 0):.0%})")
                     
                     # 참고 자료
                     st.subheader("📚 참고 자료")
                     for i, result in enumerate(results[:3]):
-                        st.caption(f"**{result.source}** - 페이지 {result.page}")
+                        st.caption(f"**{result.source}** - 페이지 {result.page} (관련도: {result.score:.2f})")
                         with st.container():
                             st.text(result.content[:300] + "..." if len(result.content) > 300 else result.content)
                     
@@ -553,14 +942,16 @@ def main():
                     elif total_time < 5:
                         st.info("✅ 적절한 응답 속도")
                     else:
-                        st.warning("⏰ 응답 시간이 다소 길었습니다")
+                        st.warning("⏰ 응답 시간이 다소 길었습니다 (복잡한 질문으로 인한 정상적인 처리)")
                 
                 # 세션에 저장
                 response_data = {
                     "answer": answer,
                     "search_time": search_time,
                     "generation_time": generation_time,
-                    "total_time": total_time
+                    "total_time": total_time,
+                    "complexity": complexity,
+                    "processing_mode": mode
                 }
                 st.session_state.messages.append({"role": "assistant", "content": response_data})
     
@@ -568,27 +959,36 @@ def main():
     st.divider()
     st.caption("⚠️ 본 답변은 AI가 생성한 참고자료입니다. 중요한 사항은 반드시 원문을 확인하시기 바랍니다.")
     
-    # 사이드바 (예시 질문)
+    # 사이드바 (예시 질문 - 복잡도별로 구성)
     with st.sidebar:
-        st.header("💡 자주 묻는 질문")
+        st.header("💡 예시 질문")
         
-        st.subheader("대규모내부거래")
-        if st.button("이사회 의결이 필요한 거래 금액은?"):
-            st.session_state.new_question = "대규모내부거래에서 이사회 의결이 필요한 거래 금액 기준은?"
+        st.subheader("🟢 단순 질문 (빠른 검색)")
+        if st.button("대규모내부거래 공시 기한은?"):
+            st.session_state.new_question = "대규모내부거래 이사회 의결 후 공시 기한은 며칠인가요?"
             st.rerun()
-        if st.button("공시 기한은 언제까지인가요?"):
-            st.session_state.new_question = "대규모내부거래 이사회 의결 후 공시 기한은?"
-            st.rerun()
-            
-        st.subheader("현황공시")
-        if st.button("기업집단 현황공시 시기는?"):
-            st.session_state.new_question = "기업집단 현황공시는 언제 해야 하나요?"
+        if st.button("이사회 의결 금액 기준은?"):
+            st.session_state.new_question = "대규모내부거래에서 이사회 의결이 필요한 거래 금액은?"
             st.rerun()
             
-        st.subheader("비상장사 중요사항")
-        if st.button("주식 양도 시 공시 의무는?"):
-            st.session_state.new_question = "비상장회사 주식 양도 시 공시 의무가 있나요?"
+        st.subheader("🟡 중간 복잡도 (하이브리드)")
+        if st.button("계열사 거래 시 주의사항은?"):
+            st.session_state.new_question = "계열사와 자금거래를 할 때 어떤 절차를 거쳐야 하고 주의할 점은 무엇인가요?"
             st.rerun()
+        if st.button("비상장사 주식 양도 절차는?"):
+            st.session_state.new_question = "비상장회사가 주식을 양도할 때 필요한 절차와 공시 의무는 어떻게 되나요?"
+            st.rerun()
+            
+        st.subheader("🔴 복잡한 질문 (GPT 통합)")
+        if st.button("복합 거래 분석"):
+            st.session_state.new_question = "A회사가 B계열사에 자금을 대여하면서 동시에 C계열사의 주식을 취득하는 경우, 각각 어떤 규제가 적용되고 공시는 어떻게 해야 하나요?"
+            st.rerun()
+        if st.button("종합적 리스크 검토"):
+            st.session_state.new_question = "우리 회사가 여러 계열사와 동시에 거래를 진행할 때 대규모내부거래 규제와 관련하여 종합적으로 검토해야 할 리스크와 대응 전략은?"
+            st.rerun()
+        
+        st.divider()
+        st.caption("💡 복잡한 질문일수록 더 정확한 답변을 제공하지만, 처리 시간과 비용이 증가합니다.")
     
     # 새 질문 처리
     if "new_question" in st.session_state:
