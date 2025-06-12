@@ -1,8 +1,12 @@
+# 기존 라이브러리들
 streamlit
-sentence-transformers
-faiss-cpu
-numpy
 openai
+faiss-cpu
+sentence-transformers
+numpy
 pandas
-torch>=1.9.0
-transformers>=4.20.0
+scikit-learn
+
+# 새로 추가해야 할 라이브러리들
+cryptography>=41.0.0  # API 키 암호화를 위해 필요
+ijson>=3.2.0         # 대용량 JSON 파일 스트리밍을 위해 필요
