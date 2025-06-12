@@ -1266,30 +1266,9 @@ def determine_temperature(query: str, complexity: str) -> float:
     return temp
 
 def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str:
-    """3단계 AI 시스템을 활용한 고품질 답변 생성"""
+    """AI를 활용한 고품질 답변 생성"""
     
-    # 3단계 시스템 정보 확인
-    gpt_analysis = stats.get('gpt_analysis', {})
-    three_stage_info = gpt_analysis.get('three_stage_info')
-    
-    if three_stage_info:
-        # 3단계 시스템 사용
-        three_stage_processor = ThreeStageAIProcessor()
-        
-        # 3단계: o4-mini를 사용한 추론형 답변 생성
-        try:
-            answer = three_stage_processor.stage3_reasoning_answer(
-                query, 
-                results, 
-                three_stage_info['intent_analysis'],
-                three_stage_info['search_strategy']
-            )
-            return answer
-        except Exception as e:
-            logger.error(f"3-stage answer generation error: {str(e)}")
-            # 폴백으로 기존 방식 사용
-    
-    # 폴백: 기존 방식 (3단계 시스템 실패 시)
+    # 컨텍스트 구성
     context_parts = []
     
     for i, result in enumerate(results[:5]):
@@ -1301,6 +1280,7 @@ def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str
     context = "\n---\n".join(context_parts)
     
     # 복잡도 정보 활용
+    gpt_analysis = stats.get('gpt_analysis', {})
     complexity = gpt_analysis.get('query_analysis', {}).get('actual_complexity', 'medium')
     temperature = determine_temperature(query, complexity)
     
@@ -1323,7 +1303,7 @@ def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str
     
     if category:
         category_instructions = {
-            '대규모내부거래': "이사회 의결 요건, 공시 기한, 면제 조건을 명확히 설명하세요. 금액 기준은 100억원 이상입니다.",
+            '대규모내부거래': "이사회 의결 요건, 공시 기한, 면제 조건을 명확히 설명하세요.",
             '현황공시': "공시 주체, 시기, 제출 서류를 구체적으로 안내하세요.",
             '비상장사 중요사항': "공시 대상 거래, 기한, 제출 방법을 상세히 설명하세요."
         }
