@@ -22,7 +22,18 @@ import gc
 import concurrent.futures
 from functools import lru_cache
 from datetime import datetime, timedelta
+import pickle
 
+# load_models_and_data 함수 내에 추가
+# BM25 인덱스 로드 (선택사항)
+try:
+    with open("bm25_index.pkl", "rb") as f:
+        bm25_index = pickle.load(f)
+    logger.info("Loaded BM25 index")
+except:
+    bm25_index = None
+    logger.warning("BM25 index not loaded")
+    
 # ===== 로깅 설정 =====
 def setup_logging():
     """구조화된 로깅 시스템 설정
@@ -1828,7 +1839,7 @@ def load_models_and_data():
     """필요한 모델과 데이터 로드"""
     try:
         # 필수 파일 확인
-        required_files = ["manuals_vector_db.index", "all_manual_chunks.json"]
+        required_files = ["manuals_vector_db_enhanced.index", "all_manual_chunks_enhanced.json"]
         missing_files = [f for f in required_files if not os.path.exists(f)]
         
         if missing_files:
@@ -1838,11 +1849,11 @@ def load_models_and_data():
         
         with st.spinner("🤖 AI 시스템을 준비하는 중... (최초 1회만 수행됩니다)"):
             # FAISS 인덱스 로드
-            index = faiss.read_index("manuals_vector_db.index")
+            index = faiss.read_index("manuals_vector_db_enhanced.index")
             logger.info(f"Loaded FAISS index with {index.ntotal} vectors")
             
             # 청크 데이터 로드
-            with open("all_manual_chunks.json", "r", encoding="utf-8") as f:
+            with open("all_manual_chunks_enhanced.json", "r", encoding="utf-8") as f:
                 chunks = json.load(f)
             logger.info(f"Loaded {len(chunks)} chunks")
             
