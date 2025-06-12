@@ -1,4 +1,4 @@
-# 파일 이름: app_manual.py (공정거래위원회 AI 법률 보조원 - 완전 통합 최적화 버전)
+# 파일 이름: app_manual.py (공정거래위원회 AI 법률 보조원 - 개선된 버전)
 
 import streamlit as st
 import faiss
@@ -21,9 +21,6 @@ import traceback
 import gc
 import concurrent.futures
 from functools import lru_cache
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
 from datetime import datetime, timedelta
 
 # ===== 로깅 설정 =====
@@ -185,30 +182,6 @@ st.markdown("""
         color: #721c24;
     }
     
-    /* 비용 효율성 표시 */
-    .cost-efficiency {
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 12px;
-        font-size: 0.8rem;
-        margin-left: 4px;
-    }
-    
-    .cost-saved {
-        background-color: #d4edda;
-        color: #155724;
-    }
-    
-    .cost-normal {
-        background-color: #e2e3e5;
-        color: #383d41;
-    }
-    
-    .cost-high {
-        background-color: #f8d7da;
-        color: #721c24;
-    }
-    
     /* 경고 메시지 스타일 */
     .version-warning {
         background-color: #fff3cd;
@@ -217,6 +190,30 @@ st.markdown("""
         padding: 10px;
         border-radius: 5px;
         margin: 10px 0;
+    }
+    
+    /* 중요도 표시 스타일 */
+    .importance-indicator {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.8rem;
+        margin-left: 4px;
+    }
+    
+    .importance-critical {
+        background-color: #dc3545;
+        color: white;
+    }
+    
+    .importance-high {
+        background-color: #fd7e14;
+        color: white;
+    }
+    
+    .importance-normal {
+        background-color: #6c757d;
+        color: white;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -280,6 +277,12 @@ class QueryComplexity(Enum):
     SIMPLE = "simple"
     MEDIUM = "medium"
     COMPLEX = "complex"
+
+class QueryImportance(Enum):
+    """질문 중요도 레벨 - 법적 리스크와 금액을 고려"""
+    CRITICAL = "critical"  # 법적 리스크가 높거나 대규모 금액
+    HIGH = "high"         # 중요한 법적 판단이 필요
+    NORMAL = "normal"     # 일반적인 질문
 
 # ===== LRU 캐시 구현 =====
 class LRUCache:
@@ -592,250 +595,171 @@ class ConflictResolver:
         
         return results
 
-# ===== 비용 관리 시스템 =====
-class BudgetManager:
-    """API 사용 비용을 추적하고 관리하는 시스템
+# ===== 중요도 평가 시스템 =====
+class ImportanceAssessor:
+    """질문의 중요도를 평가하는 시스템
     
-    이 클래스는 마치 가계부를 작성하는 것과 같습니다.
-    얼마나 사용했고, 얼마나 남았는지를 추적하여
-    예산 내에서 효율적으로 운영할 수 있게 합니다.
+    법적 리스크와 금액을 고려하여 질문의 중요도를 판단합니다.
+    이는 응급실에서 환자의 중증도를 분류하는 것과 같은 원리입니다.
     """
-    def __init__(self, daily_budget: float = 50.0):
-        self.daily_budget = daily_budget
-        self.reset_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    def __init__(self):
+        # 법적 리스크 키워드
+        self.legal_risk_keywords = {
+            'critical': ['공시의무', '이사회의결', '법적책임', '제재', '과태료', '위반', '처벌'],
+            'high': ['대규모내부거래', '계열사거래', '특수관계인', '공정거래법', '신고의무'],
+            'medium': ['절차', '기한', '보고', '제출', '통지']
+        }
         
-        # 모델별 비용 정보 (1M 토큰당 달러)
-        self.model_costs = {
-            'gpt-4o-mini': {
-                'input': 0.15,
-                'cached': 0.075,
-                'output': 0.60
-            },
-            'o4-mini': {
-                'input': 1.10,
-                'cached': 0.275,
-                'output': 4.40
-            },
-            'gpt-4o': {
-                'input': 2.50,
-                'cached': 1.25,
-                'output': 10.00
-            }
+        # 금액 임계값 (억원)
+        self.amount_thresholds = {
+            'critical': 100,  # 100억원 이상
+            'high': 50,       # 50억원 이상
+            'medium': 10      # 10억원 이상
         }
     
-    def calculate_cost(self, model: str, input_tokens: int, 
-                      output_tokens: int, cached: bool = False) -> float:
-        """토큰 수를 기반으로 비용 계산
+    def assess_importance(self, query: str) -> Tuple[QueryImportance, Dict]:
+        """질문의 중요도를 평가
         
-        API 비용은 입력과 출력 토큰 수에 따라 결정됩니다.
-        캐시된 입력은 할인된 가격이 적용됩니다.
+        금액과 법적 리스크를 종합적으로 고려하여
+        질문이 얼마나 중요한지 판단합니다.
         """
-        costs = self.model_costs[model]
-        input_cost = costs['cached' if cached else 'input'] * (input_tokens / 1_000_000)
-        output_cost = costs['output'] * (output_tokens / 1_000_000)
-        return input_cost + output_cost
-    
-    def get_current_status(self) -> Dict:
-        """현재 예산 상황 반환"""
-        # 세션 상태에서 오늘의 사용량 가져오기
-        if 'daily_cost' not in st.session_state:
-            st.session_state.daily_cost = 0.0
-            
-        # 날짜가 바뀌었으면 리셋
-        current_date = datetime.now().date()
-        if 'last_reset_date' not in st.session_state:
-            st.session_state.last_reset_date = current_date
-        elif st.session_state.last_reset_date != current_date:
-            st.session_state.daily_cost = 0.0
-            st.session_state.last_reset_date = current_date
-            logger.info("Daily budget reset for new day")
-            
-        used = st.session_state.daily_cost
-        remaining = self.daily_budget - used
+        importance_score = 0
+        factors = []
         
-        return {
-            'used': used,
-            'remaining': remaining,
-            'remaining_ratio': remaining / self.daily_budget if self.daily_budget > 0 else 0,
-            'is_budget_critical': remaining < self.daily_budget * 0.2,
-            'budget_exhausted': remaining <= 0
+        query_lower = query.lower()
+        
+        # 금액 확인
+        amount_matches = re.findall(r'(\d+)억\s*원', query)
+        max_amount = 0
+        for amount_str in amount_matches:
+            amount = int(amount_str)
+            max_amount = max(max_amount, amount)
+            
+            if amount >= self.amount_thresholds['critical']:
+                importance_score += 10
+                factors.append(f"{amount}억원 - 대규모 거래")
+            elif amount >= self.amount_thresholds['high']:
+                importance_score += 7
+                factors.append(f"{amount}억원 - 중규모 거래")
+            elif amount >= self.amount_thresholds['medium']:
+                importance_score += 4
+                factors.append(f"{amount}억원 거래")
+        
+        # 법적 리스크 키워드 확인
+        for level, keywords in self.legal_risk_keywords.items():
+            for keyword in keywords:
+                if keyword in query_lower:
+                    if level == 'critical':
+                        importance_score += 8
+                        factors.append(f"핵심 법적 개념: {keyword}")
+                    elif level == 'high':
+                        importance_score += 5
+                        factors.append(f"중요 법적 개념: {keyword}")
+                    else:
+                        importance_score += 2
+                        factors.append(f"법적 개념: {keyword}")
+        
+        # 복합 거래 여부
+        if '동시에' in query_lower or ('그리고' in query_lower and '거래' in query_lower):
+            importance_score += 3
+            factors.append("복합 거래 분석 필요")
+        
+        # 중요도 레벨 결정
+        if importance_score >= 15 or max_amount >= self.amount_thresholds['critical']:
+            importance = QueryImportance.CRITICAL
+        elif importance_score >= 8 or max_amount >= self.amount_thresholds['high']:
+            importance = QueryImportance.HIGH
+        else:
+            importance = QueryImportance.NORMAL
+        
+        return importance, {
+            'score': importance_score,
+            'factors': factors,
+            'max_amount': max_amount
         }
-    
-    def add_usage(self, cost: float):
-        """사용 비용 추가"""
-        st.session_state.daily_cost = st.session_state.get('daily_cost', 0.0) + cost
-        logger.info(f"Added ${cost:.4f} to daily cost. Total: ${st.session_state.daily_cost:.4f}")
 
 # ===== 모델 선택 시스템 =====
 class OptimizedModelSelector:
-    """세 가지 모델만을 사용하는 최적화된 모델 선택 시스템
+    """질문의 중요도와 복잡도를 고려한 최적화된 모델 선택 시스템
     
-    이 시스템은 마치 프로젝트 매니저가 팀원을 배정하는 것과 같습니다.
-    각 작업의 특성을 파악하고, 가장 적합한 팀원(모델)을 선택합니다.
-    중요한 점은 o4-mini가 gpt-4o보다 저렴하면서도 추론 능력이 뛰어나다는 것입니다.
+    이 시스템은 마치 병원에서 환자의 상태에 따라
+    적절한 의료진을 배정하는 것과 같습니다.
+    중요한 질문에는 더 정확한 모델을 사용합니다.
     """
     
     def __init__(self):
         self.model_profiles = {
             'gpt-4o-mini': {
-                'cost_per_1k': 0.00015,
-                'strengths': ['speed', 'simple_queries', 'fact_checking'],
-                'max_tokens': 2000,
-                'decision_threshold': 0.3,
-                'performance_score': 0.6,
+                'accuracy_score': 0.65,
+                'speed_score': 0.95,
+                'best_for': ['simple_facts', 'basic_queries'],
                 'description': '간단한 사실 확인에 최적화된 경제적 모델'
             },
             'o4-mini': {
-                'cost_per_1k': 0.0011,
-                'strengths': ['reasoning', 'analysis', 'multi_step', 'complex_logic'],
-                'max_tokens': 4000,
-                'decision_threshold': 0.85,
-                'performance_score': 0.85,  # gpt-4o보다 높은 추론 능력
-                'description': '뛰어난 추론 능력을 가진 주력 모델'
+                'accuracy_score': 0.75,
+                'speed_score': 0.93,
+                'best_for': ['standard_queries', 'basic_analysis'],
+                'description': '표준적인 질문에 대한 빠른 처리'
+            },
+            'o3-mini': {
+                'accuracy_score': 0.78,
+                'speed_score': 0.90,
+                'best_for': ['intermediate_queries', 'moderate_complexity'],
+                'description': '중간 복잡도의 분석이 가능한 모델'
             },
             'gpt-4o': {
-                'cost_per_1k': 0.0025,
-                'strengths': ['long_context', 'creative', 'special_formats'],
-                'max_tokens': 8000,
-                'decision_threshold': 0.95,
-                'performance_score': 0.75,  # o4-mini보다 낮은 추론 능력
-                'description': '특수한 경우를 위한 고급 모델'
+                'accuracy_score': 0.90,
+                'speed_score': 0.80,
+                'best_for': ['complex_analysis', 'legal_interpretation', 'critical_decisions'],
+                'description': '복잡한 법률 해석과 중요한 판단에 최적화된 모델'
             }
         }
-        
-        self.budget_manager = BudgetManager()
-        
-    def select_model(self, query: str, initial_analysis: Dict, 
-                    complexity_assessment: Dict) -> Tuple[str, Dict]:
+    
+    def select_model(self, query: str, complexity: QueryComplexity, 
+                    importance: QueryImportance, initial_analysis: Dict) -> Tuple[str, Dict]:
         """질문에 가장 적합한 모델을 선택
         
-        선택 과정은 다음과 같습니다:
-        1. 질문의 복잡도와 특성 파악
-        2. 현재 예산 상황 확인
-        3. 각 모델의 강점과 비용을 고려
-        4. 최적의 모델 선택
+        중요도가 높은 질문은 복잡도와 관계없이 상위 모델을 사용합니다.
+        이는 수술의 난이도와 관계없이 중요한 수술은
+        경험 많은 의사가 집도하는 것과 같은 원리입니다.
         """
         
-        # 복잡도 점수 가져오기
-        complexity_score = complexity_assessment.get('score', 0.5)
-        complexity_level = complexity_assessment.get('level', QueryComplexity.MEDIUM)
+        # 중요도가 CRITICAL인 경우 무조건 최고 모델 사용
+        if importance == QueryImportance.CRITICAL:
+            selected_model = 'gpt-4o'
+            reason = "법적 리스크가 높거나 대규모 금액이 관련된 중요한 질문"
         
-        # 현재 예산 상황 확인
-        budget_status = self.budget_manager.get_current_status()
+        # 중요도가 HIGH인 경우 상위 모델 사용
+        elif importance == QueryImportance.HIGH:
+            if complexity == QueryComplexity.COMPLEX:
+                selected_model = 'gpt-4o'
+                reason = "중요하고 복잡한 법률 해석이 필요한 질문"
+            else:
+                selected_model = 'o3-mini'
+                reason = "중요도가 높은 표준적인 질문"
         
-        # 기본 모델 선택 로직
-        selected_model = self._select_base_model(
-            query, complexity_score, initial_analysis
-        )
-        
-        # 예산 제약에 따른 조정
-        if budget_status['is_budget_critical']:
-            selected_model = self._adjust_for_budget(
-                selected_model, budget_status
-            )
-        
-        # 선택 이유 생성
-        reason = self._generate_selection_reason(
-            selected_model, complexity_score, budget_status
-        )
+        # 일반적인 경우 복잡도에 따라 선택
+        else:
+            if complexity == QueryComplexity.SIMPLE:
+                selected_model = 'gpt-4o-mini'
+                reason = "간단한 사실 확인 또는 기본 정보 요청"
+            elif complexity == QueryComplexity.MEDIUM:
+                selected_model = 'o4-mini'
+                reason = "표준적인 절차나 규정에 대한 질문"
+            else:
+                selected_model = 'o3-mini'
+                reason = "복잡하지만 중요도가 낮은 질문"
         
         selection_info = {
             'model': selected_model,
             'reason': reason,
-            'complexity_score': complexity_score,
-            'complexity_level': complexity_level.value,
-            'budget_remaining': budget_status['remaining_ratio'],
-            'estimated_cost': self._estimate_query_cost(selected_model),
-            'performance_score': self.model_profiles[selected_model]['performance_score']
+            'complexity': complexity.value,
+            'importance': importance.value,
+            'accuracy_score': self.model_profiles[selected_model]['accuracy_score']
         }
         
         return selected_model, selection_info
-    
-    def _select_base_model(self, query: str, complexity_score: float, 
-                          analysis: Dict) -> str:
-        """기본 모델 선택 로직
-        
-        복잡도와 질문 특성을 기반으로 최적 모델을 선택합니다.
-        o4-mini를 우선적으로 고려하여 비용 대비 성능을 최적화합니다.
-        """
-        
-        # 단순한 질문: gpt-4o-mini
-        if complexity_score < 0.3:
-            # 단순 사실 확인, 정의, 날짜/금액 확인 등
-            return 'gpt-4o-mini'
-        
-        # 표준~복잡한 질문: o4-mini (주력 모델)
-        elif complexity_score < 0.85:
-            # 추론, 분석, 단계별 설명이 필요한 대부분의 질문
-            return 'o4-mini'
-        
-        # 매우 복잡한 질문
-        else:
-            # 특별한 경우 확인
-            if self._requires_special_handling(query):
-                return 'gpt-4o'
-            else:
-                # 대부분의 복잡한 질문도 o4-mini가 더 효과적
-                return 'o4-mini'
-    
-    def _requires_special_handling(self, query: str) -> bool:
-        """gpt-4o가 꼭 필요한 특수한 경우인지 확인
-        
-        o4-mini가 추론은 더 잘하지만, gpt-4o가 필요한 경우:
-        - 매우 긴 문맥 처리 (1000자 이상)
-        - 창의적 콘텐츠 생성
-        - 특수한 형식의 출력
-        """
-        # 긴 문맥
-        if len(query) > 1000:
-            return True
-        
-        # 창의적 작업
-        creative_keywords = ['시나리오', '스토리', '창의적', '아이디어', '제안서']
-        if any(keyword in query for keyword in creative_keywords):
-            return True
-        
-        # 특수 형식
-        format_keywords = ['표', '다이어그램', '차트', '그래프']
-        if any(keyword in query for keyword in format_keywords):
-            return True
-        
-        return False
-    
-    def _adjust_for_budget(self, selected_model: str, 
-                          budget_status: Dict) -> str:
-        """예산 제약에 따른 모델 조정"""
-        if budget_status['budget_exhausted']:
-            return 'gpt-4o-mini'  # 예산 소진 시 가장 저렴한 모델만 사용
-        
-        if selected_model == 'gpt-4o' and budget_status['remaining_ratio'] < 0.3:
-            return 'o4-mini'  # gpt-4o 대신 o4-mini 사용
-        elif selected_model == 'o4-mini' and budget_status['remaining_ratio'] < 0.1:
-            return 'gpt-4o-mini'  # 극도로 예산이 부족할 때
-        
-        return selected_model
-    
-    def _generate_selection_reason(self, model: str, complexity_score: float,
-                                  budget_status: Dict) -> str:
-        """모델 선택 이유를 사용자가 이해하기 쉽게 설명"""
-        base_reasons = {
-            'gpt-4o-mini': f"간단한 질문 (복잡도: {complexity_score:.2f})",
-            'o4-mini': f"추론과 분석이 필요한 질문 (복잡도: {complexity_score:.2f})",
-            'gpt-4o': f"특수한 처리가 필요한 질문 (복잡도: {complexity_score:.2f})"
-        }
-        
-        reason = base_reasons.get(model, "알 수 없음")
-        
-        # 예산 조정이 있었다면 추가
-        if budget_status['is_budget_critical']:
-            reason += " (예산 고려)"
-        
-        return reason
-    
-    def _estimate_query_cost(self, model: str) -> float:
-        """질문 처리 예상 비용"""
-        avg_tokens = 3000  # 평균 토큰 수
-        return self.model_profiles[model]['cost_per_1k'] * (avg_tokens / 1000) * 2
 
 # ===== 캐싱 전략 시스템 =====
 class SmartCacheStrategy:
@@ -850,18 +774,19 @@ class SmartCacheStrategy:
         self.cache_configs = {
             'gpt-4o-mini': {
                 'ttl': 7200,  # 2시간 - 저렴하므로 오래 보관
-                'similarity_threshold': 0.85,
-                'cache_benefit_ratio': 0.5  # 50% 비용 절감
+                'similarity_threshold': 0.85
             },
             'o4-mini': {
+                'ttl': 5400,  # 1.5시간
+                'similarity_threshold': 0.88
+            },
+            'o3-mini': {
                 'ttl': 3600,  # 1시간
-                'similarity_threshold': 0.9,
-                'cache_benefit_ratio': 0.75  # 75% 비용 절감
+                'similarity_threshold': 0.90
             },
             'gpt-4o': {
-                'ttl': 2400,  # 40분
-                'similarity_threshold': 0.92,
-                'cache_benefit_ratio': 0.5
+                'ttl': 1800,  # 30분 - 중요한 질문은 자주 업데이트
+                'similarity_threshold': 0.95
             }
         }
         
@@ -877,8 +802,16 @@ class SmartCacheStrategy:
         cache_key = self._generate_cache_key(query)
         return self.query_cache.get(cache_key)
     
-    def store_result(self, query: str, result: Dict, model: str):
-        """결과를 캐시에 저장"""
+    def store_result(self, query: str, result: Dict, model: str, importance: QueryImportance):
+        """결과를 캐시에 저장
+        
+        중요한 질문의 결과는 캐싱하지 않거나 짧게 보관합니다.
+        이는 중요한 정보일수록 최신성이 더 중요하기 때문입니다.
+        """
+        # CRITICAL 중요도의 질문은 캐싱하지 않음
+        if importance == QueryImportance.CRITICAL:
+            return
+        
         cache_key = self._generate_cache_key(query)
         result['cached_at'] = time.time()
         result['model'] = model
@@ -887,37 +820,25 @@ class SmartCacheStrategy:
     def _generate_cache_key(self, query: str) -> str:
         """쿼리에 대한 고유한 캐시 키 생성"""
         return hashlib.md5(query.encode()).hexdigest()
-    
-    def should_use_cache(self, similarity: float, model: str, 
-                        cache_age: float) -> bool:
-        """캐시 사용 여부 결정"""
-        config = self.cache_configs[model]
-        
-        # 유사도가 임계값보다 높고
-        if similarity < config['similarity_threshold']:
-            return False
-        
-        # 캐시가 만료되지 않았다면
-        if cache_age > config['ttl']:
-            return False
-        
-        return True
 
-# ===== GPT-4o 질문 분석기 =====
-class GPT4oQueryAnalyzer:
-    """GPT-4o-mini를 활용한 통합 질문 분석 및 검색 전략 수립
+# ===== GPT 질문 분석기 =====
+class AdaptiveQueryAnalyzer:
+    """질문의 중요도에 따라 적응적으로 분석하는 시스템
     
-    이 클래스는 마치 경험 많은 사서가 도서관에서
-    책을 찾는 것을 도와주는 것과 같습니다.
-    질문을 분석하여 어떤 정보가 필요한지,
-    어디서 찾아야 하는지를 파악합니다.
+    중요한 질문은 더 정교한 분석을 수행합니다.
+    이는 중요한 서류는 더 꼼꼼히 검토하는 것과 같은 원리입니다.
     """
     
-    def __init__(self, cache_strategy: SmartCacheStrategy):
+    def __init__(self, cache_strategy: SmartCacheStrategy, importance_assessor: ImportanceAssessor):
         self.cache_strategy = cache_strategy
+        self.importance_assessor = importance_assessor
     
-    def analyze_and_strategize(self, query: str, available_chunks_info: Dict) -> Dict:
-        """질문을 분석하고 최적의 검색 전략 수립"""
+    def analyze_and_strategize(self, query: str, available_chunks_info: Dict, 
+                              importance: QueryImportance) -> Dict:
+        """질문을 분석하고 최적의 검색 전략 수립
+        
+        중요한 질문은 더 정교한 분석을 위해 상위 모델을 사용합니다.
+        """
         
         # 캐시 확인
         cache_key = hashlib.md5(f"analysis_{query}".encode()).hexdigest()
@@ -925,6 +846,12 @@ class GPT4oQueryAnalyzer:
         if cached:
             logger.info(f"Analysis cache hit for query: {query[:50]}...")
             return cached
+        
+        # 중요도에 따라 분석 모델 선택
+        if importance == QueryImportance.CRITICAL:
+            analysis_model = "gpt-4o"  # 중요한 질문은 최고 모델로 분석
+        else:
+            analysis_model = "gpt-4o-mini"  # 일반 질문은 경제적 모델 사용
         
         prompt = f"""
         당신은 공정거래법 전문가입니다. 다음 질문을 분석하고 최적의 검색 전략을 수립해주세요.
@@ -969,7 +896,7 @@ class GPT4oQueryAnalyzer:
         
         try:
             response = openai.chat.completions.create(
-                model="gpt-4o-mini",  # 분석에는 저렴한 모델 사용
+                model=analysis_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
                 max_tokens=1000,
@@ -978,13 +905,14 @@ class GPT4oQueryAnalyzer:
             
             analysis = json.loads(response.choices[0].message.content)
             
-            # 캐시 저장
-            self.cache_strategy.analysis_cache.put(cache_key, analysis)
+            # 캐시 저장 (중요한 질문은 캐시하지 않음)
+            if importance != QueryImportance.CRITICAL:
+                self.cache_strategy.analysis_cache.put(cache_key, analysis)
             
             return analysis
             
         except Exception as e:
-            logger.error(f"GPT-4o analysis error: {str(e)}")
+            logger.error(f"Query analysis error: {str(e)}")
             return self._get_fallback_strategy(query)
     
     def _get_fallback_strategy(self, query: str) -> Dict:
@@ -1170,28 +1098,18 @@ class ComplexityAssessor:
             'complex_score': complex_score,
             'total_score': total_score,
             'normalized_score': normalized_score,
-            'query_length': len(query),
-            'estimated_cost_multiplier': self._estimate_cost_multiplier(complexity)
+            'query_length': len(query)
         }
         
         return complexity, confidence, analysis
-    
-    def _estimate_cost_multiplier(self, complexity: QueryComplexity) -> float:
-        """복잡도에 따른 예상 비용 배수"""
-        multipliers = {
-            QueryComplexity.SIMPLE: 1.0,
-            QueryComplexity.MEDIUM: 3.0,
-            QueryComplexity.COMPLEX: 10.0
-        }
-        return multipliers[complexity]
 
 # ===== 하이브리드 RAG 파이프라인 =====
 class OptimizedHybridRAGPipeline:
-    """비용 최적화가 적용된 완전한 하이브리드 RAG 파이프라인
+    """중요도 기반 적응적 처리를 수행하는 하이브리드 RAG 파이프라인
     
     이 클래스는 전체 시스템의 핵심입니다.
-    마치 오케스트라의 지휘자처럼, 모든 구성 요소들을
-    조화롭게 운영하여 최고의 성능을 이끌어냅니다.
+    질문의 중요도에 따라 다른 수준의 처리를 수행하여
+    정확성과 효율성의 균형을 맞춥니다.
     """
     
     def __init__(self, embedding_model, reranker_model, index, chunks):
@@ -1217,11 +1135,11 @@ class OptimizedHybridRAGPipeline:
         self.cache_strategy = SmartCacheStrategy()
         self.version_manager = DocumentVersionManager()
         self.conflict_resolver = ConflictResolver(self.version_manager)
-        self.budget_manager = BudgetManager()
+        self.importance_assessor = ImportanceAssessor()
         
         self.classifier = QuestionClassifier()
         self.complexity_assessor = ComplexityAssessor()
-        self.gpt4o_analyzer = GPT4oQueryAnalyzer(self.cache_strategy)
+        self.query_analyzer = AdaptiveQueryAnalyzer(self.cache_strategy, self.importance_assessor)
         self.model_selector = OptimizedModelSelector()
         
         # 매뉴얼별 인덱스 구축
@@ -1240,10 +1158,7 @@ class OptimizedHybridRAGPipeline:
         logger.info(f"Manual distribution: {self.chunks_info}")
     
     def _extract_chunk_dates(self):
-        """모든 청크의 날짜 정보를 미리 추출
-        
-        시작할 때 한 번만 수행하여 성능을 최적화합니다.
-        """
+        """모든 청크의 날짜 정보를 미리 추출"""
         for chunk in self.chunks:
             doc_date = self.version_manager.extract_document_date(chunk)
             if doc_date:
@@ -1288,75 +1203,75 @@ class OptimizedHybridRAGPipeline:
     async def process_query(self, query: str, top_k: int = 5) -> Tuple[List[SearchResult], Dict]:
         """질문을 처리하는 메인 메서드
         
-        이 메서드는 전체 처리 과정을 조율합니다:
-        1. 캐시 확인
-        2. 질문 분석 및 복잡도 평가
-        3. 모델 선택
-        4. 검색 전략 실행
-        5. 충돌 해결 및 최신 정보 우선시
+        중요한 질문은 더 신중하게, 일반적인 질문은 효율적으로 처리합니다.
         """
         start_time = time.time()
         
-        # 1. 캐시 확인
-        cached_result = self.cache_strategy.get_cached_result(query)
-        if cached_result:
-            logger.info(f"Cache hit for query: {query[:50]}...")
-            return cached_result['results'], cached_result['stats']
+        # 1. 중요도 평가
+        importance, importance_info = self.importance_assessor.assess_importance(query)
+        logger.info(f"Query importance: {importance.value} - {importance_info['factors']}")
         
-        # 2. 질문 분류 및 복잡도 평가
+        # 2. 캐시 확인 (중요한 질문은 캐시 사용 안 함)
+        if importance != QueryImportance.CRITICAL:
+            cached_result = self.cache_strategy.get_cached_result(query)
+            if cached_result:
+                logger.info(f"Cache hit for query: {query[:50]}...")
+                return cached_result['results'], cached_result['stats']
+        
+        # 3. 질문 분류 및 복잡도 평가
         category, cat_confidence = self.classifier.classify(query)
         complexity, comp_confidence, complexity_analysis = self.complexity_assessor.assess(query)
         
-        # 3. GPT 분석
+        # 4. 적응적 질문 분석 (중요한 질문은 더 정교하게 분석)
         analysis_start = time.time()
         try:
-            gpt_analysis = self.gpt4o_analyzer.analyze_and_strategize(
-                query, self.chunks_info
+            gpt_analysis = self.query_analyzer.analyze_and_strategize(
+                query, self.chunks_info, importance
             )
             analysis_time = time.time() - analysis_start
         except Exception as e:
-            logger.error(f"GPT-4o analysis failed: {str(e)}, falling back to rule-based")
+            logger.error(f"Query analysis failed: {str(e)}, falling back to rule-based")
             gpt_analysis = self._get_fallback_analysis(query, category)
             analysis_time = time.time() - analysis_start
         
-        # 4. 모델 선택
-        complexity_assessment = {
-            'level': complexity,
-            'confidence': comp_confidence,
-            'score': complexity_analysis['normalized_score'],
-            **complexity_analysis
-        }
-        
+        # 5. 모델 선택 (중요도 우선 고려)
         selected_model, selection_info = self.model_selector.select_model(
-            query, gpt_analysis, complexity_assessment
+            query, complexity, importance, gpt_analysis
         )
         
-        # 5. 검색 전략 실행
-        search_approach = gpt_analysis['search_strategy']['approach']
+        # 6. 중요도에 따른 검색 전략 실행
+        if importance == QueryImportance.CRITICAL:
+            # 중요한 질문은 더 광범위한 검색
+            results, search_stats = await self._comprehensive_search_for_critical(
+                query, gpt_analysis, top_k
+            )
+        else:
+            # 일반적인 검색 전략
+            search_approach = gpt_analysis['search_strategy']['approach']
+            
+            if search_approach == 'direct_lookup':
+                results, search_stats = await self._gpt_guided_direct_search(
+                    query, gpt_analysis, top_k
+                )
+            elif search_approach == 'focused_search':
+                results, search_stats = await self._gpt_guided_focused_search(
+                    query, gpt_analysis, top_k
+                )
+            else:  # comprehensive_analysis
+                results, search_stats = await self._gpt_guided_comprehensive_search(
+                    query, gpt_analysis, top_k
+                )
         
-        if search_approach == 'direct_lookup':
-            results, search_stats = await self._gpt_guided_direct_search(
-                query, gpt_analysis, top_k
-            )
-        elif search_approach == 'focused_search':
-            results, search_stats = await self._gpt_guided_focused_search(
-                query, gpt_analysis, top_k
-            )
-        else:  # comprehensive_analysis
-            results, search_stats = await self._gpt_guided_comprehensive_search(
-                query, gpt_analysis, top_k
-            )
-        
-        # 6. 충돌 해결 및 최신 정보 우선시
+        # 7. 충돌 해결 및 최신 정보 우선시
         results = self.conflict_resolver.resolve_conflicts(results, query)
         
-        # 7. 구버전 경고 수집
+        # 8. 구버전 경고 수집
         outdated_warnings = []
         for result in results:
             if result.metadata.get('has_outdated_info'):
                 outdated_warnings.extend(result.metadata.get('warnings', []))
         
-        # 8. 통계 정보 구성
+        # 9. 통계 정보 구성
         stats = {
             'total_time': time.time() - start_time,
             'analysis_time': analysis_time,
@@ -1366,22 +1281,65 @@ class OptimizedHybridRAGPipeline:
             'complexity': complexity.value,
             'complexity_confidence': comp_confidence,
             'complexity_analysis': complexity_analysis,
+            'importance': importance.value,
+            'importance_info': importance_info,
             'selected_model': selected_model,
             'selection_info': selection_info,
-            'search_approach': search_approach,
+            'search_approach': search_stats.get('search_method', 'unknown'),
             'outdated_warnings': outdated_warnings,
             'has_version_conflicts': len(outdated_warnings) > 0,
             **search_stats
         }
         
-        # 9. 캐시 저장 (간단한 질문만)
-        if complexity == QueryComplexity.SIMPLE and not outdated_warnings:
+        # 10. 캐시 저장 (중요하지 않은 질문만)
+        if importance != QueryImportance.CRITICAL and not outdated_warnings:
             self.cache_strategy.store_result(query, {
                 'results': results,
                 'stats': stats
-            }, selected_model)
+            }, selected_model, importance)
         
         return results, stats
+    
+    async def _comprehensive_search_for_critical(self, query: str, gpt_analysis: Dict, 
+                                               top_k: int) -> Tuple[List[SearchResult], Dict]:
+        """중요한 질문에 대한 포괄적 검색
+        
+        중요한 질문은 더 많은 문서를 검색하고,
+        여러 관점에서 정보를 수집합니다.
+        """
+        start_time = time.time()
+        all_results = []
+        
+        # 모든 관련 매뉴얼에서 광범위하게 검색
+        for manual in self.manual_indices.keys():
+            if manual != '기타':
+                partial_results = await self._search_in_manual(
+                    query, manual, [], top_k * 2  # 더 많은 결과 수집
+                )
+                all_results.extend(partial_results)
+        
+        # 중복 제거 및 정렬
+        seen_chunks = set()
+        unique_results = []
+        for result in sorted(all_results, key=lambda x: x.score, reverse=True):
+            if result.chunk_id not in seen_chunks:
+                seen_chunks.add(result.chunk_id)
+                unique_results.append(result)
+                if len(unique_results) >= top_k * 3:  # 더 많은 결과 보관
+                    break
+        
+        # 상위 결과만 반환
+        final_results = unique_results[:top_k]
+        
+        stats = {
+            'search_time': time.time() - start_time,
+            'searched_chunks': sum(len(indices) for indices in self.manual_indices.values()),
+            'search_method': 'comprehensive_critical',
+            'total_results_found': len(unique_results),
+            'results_returned': len(final_results)
+        }
+        
+        return final_results, stats
     
     async def _gpt_guided_direct_search(self, query: str, gpt_analysis: Dict, 
                                        top_k: int) -> Tuple[List[SearchResult], Dict]:
@@ -1651,56 +1609,96 @@ class OptimizedHybridRAGPipeline:
             }
         }
 
+# ===== 답변 품질 검증 시스템 =====
+class AnswerQualityValidator:
+    """생성된 답변의 품질을 검증하는 시스템
+    
+    이는 제품 출하 전 품질 검사와 같습니다.
+    답변이 정확하고 완전한지 확인합니다.
+    """
+    
+    def validate_answer(self, query: str, answer: str, importance: QueryImportance) -> Dict:
+        """답변의 품질을 검증
+        
+        중요한 질문의 답변은 더 엄격하게 검증합니다.
+        """
+        issues = []
+        quality_score = 1.0
+        
+        # 불확실한 표현 체크
+        uncertain_phrases = ['확실하지 않', '아마도', '추정', '~것 같습니다', '~수도 있습니다']
+        for phrase in uncertain_phrases:
+            if phrase in answer:
+                issues.append(f"불확실한 표현 사용: {phrase}")
+                quality_score -= 0.1
+        
+        # 법적 근거 확인
+        legal_references = re.findall(r'(제\d+조|시행령|규정|매뉴얼)', answer)
+        if len(legal_references) == 0:
+            issues.append("법적 근거 부족")
+            quality_score -= 0.2
+        
+        # 답변 길이 확인
+        if len(answer) < 100:
+            issues.append("답변이 너무 짧음")
+            quality_score -= 0.15
+        
+        # 중요한 질문의 경우 추가 검증
+        if importance == QueryImportance.CRITICAL:
+            # 구체적인 수치 확인
+            numbers = re.findall(r'\d+', answer)
+            if len(numbers) == 0:
+                issues.append("구체적인 수치 정보 부족")
+                quality_score -= 0.1
+            
+            # 주의사항 포함 여부
+            if not any(word in answer for word in ['주의', '유의', '예외', '단서']):
+                issues.append("주의사항이나 예외사항 미포함")
+                quality_score -= 0.1
+        
+        return {
+            'quality_score': max(quality_score, 0),
+            'issues': issues,
+            'passed': quality_score >= 0.7,
+            'needs_revision': quality_score < 0.7 and importance == QueryImportance.CRITICAL
+        }
+
 # ===== 답변 생성 함수 =====
-def determine_temperature(query: str, complexity: str, model: str) -> float:
-    """질문 유형, 복잡도, 모델에 따라 최적의 temperature 결정
+def determine_temperature(query: str, complexity: str, model: str, importance: str) -> float:
+    """질문 유형, 복잡도, 모델, 중요도에 따라 최적의 temperature 결정
     
     Temperature는 AI의 창의성 수준을 조절합니다.
-    낮을수록 일관되고 정확한 답변을,
-    높을수록 다양하고 창의적인 답변을 생성합니다.
+    중요한 질문일수록 낮은 temperature를 사용하여
+    일관되고 정확한 답변을 생성합니다.
     """
     query_lower = query.lower()
     
-    # 모델별 기본 temperature
-    base_temps = {
-        'gpt-4o-mini': {
-            'simple': 0.1,
-            'medium': 0.2,
-            'complex': 0.3
-        },
-        'o4-mini': {
-            'simple': 0.1,
-            'medium': 0.3,
-            'complex': 0.5
-        },
-        'gpt-4o': {
-            'simple': 0.2,
-            'medium': 0.4,
-            'complex': 0.6
-        }
-    }
+    # 중요도별 기본 temperature
+    if importance == 'critical':
+        base_temp = 0.1  # 매우 낮게 설정
+    elif importance == 'high':
+        base_temp = 0.2
+    else:
+        base_temp = 0.3
     
-    temp = base_temps.get(model, {}).get(complexity, 0.3)
-    
-    # 질문 유형에 따른 조정
+    # 질문 유형에 따른 미세 조정
     if any(keyword in query_lower for keyword in ['언제', '며칠', '기한', '날짜', '금액', '%']):
-        temp = min(temp, 0.1)  # 사실 확인은 정확성이 중요
+        base_temp = min(base_temp, 0.1)  # 사실 확인은 정확성이 중요
     elif any(keyword in query_lower for keyword in ['전략', '대응', '리스크', '주의', '권장']):
-        temp = max(temp, 0.5)  # 전략적 조언은 다양한 관점 필요
+        base_temp = min(base_temp + 0.1, 0.5)  # 전략적 조언도 신중하게
     
-    return temp
+    return base_temp
 
 async def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> Tuple[str, Dict]:
     """선택된 모델을 사용하여 고품질 답변 생성
     
-    이 함수는 검색된 정보를 바탕으로
-    사용자가 이해하기 쉬운 답변을 생성합니다.
-    마치 전문가가 자료를 검토한 후
-    명확하고 실용적인 조언을 제공하는 것과 같습니다.
+    중요한 질문은 더 신중하게 답변을 생성하고,
+    필요시 품질 검증 후 재생성합니다.
     """
     
-    # 선택된 모델 확인
+    # 선택된 모델 및 중요도 확인
     model = stats.get('selected_model', 'gpt-4o-mini')
+    importance = stats.get('importance', 'normal')
     
     # 컨텍스트 구성
     context_parts = []
@@ -1709,6 +1707,7 @@ async def generate_answer(query: str, results: List[SearchResult], stats: Dict) 
     if stats.get('has_version_conflicts'):
         context_parts.append("⚠️ 주의: 일부 참고 자료에 구버전 정보가 포함되어 있을 수 있습니다.\n")
     
+    # 검색 결과 포함
     for i, result in enumerate(results[:5]):
         # 구버전 정보 표시
         warning_marker = ""
@@ -1726,35 +1725,18 @@ async def generate_answer(query: str, results: List[SearchResult], stats: Dict) 
     
     # 복잡도 정보 활용
     complexity = stats.get('complexity', 'medium')
-    temperature = determine_temperature(query, complexity, model)
+    temperature = determine_temperature(query, complexity, model, importance)
     
-    # 질문 유형별 지시사항
-    gpt_analysis = stats.get('gpt_analysis', {})
-    answer_requirements = gpt_analysis.get('answer_requirements', {})
-    
-    # 동적 지시사항 생성
-    instructions = []
-    if answer_requirements.get('needs_specific_numbers'):
-        instructions.append("정확한 금액과 수치를 명시하세요.")
-    if answer_requirements.get('needs_process_steps'):
-        instructions.append("절차를 단계별로 설명하세요.")
-    if answer_requirements.get('needs_timeline'):
-        instructions.append("기한과 시간 순서를 명확히 하세요.")
-    if answer_requirements.get('needs_exceptions'):
-        instructions.append("예외 사항과 특별한 경우를 설명하세요.")
-    
-    instruction_text = " ".join(instructions) if instructions else "명확하고 실무적인 답변을 제공하세요."
-    
-    # 카테고리별 특화 지시사항
-    category = stats.get('category')
-    category_instructions = {
-        '대규모내부거래': "이사회 의결 요건, 공시 기한, 면제 조건을 명확히 설명하세요.",
-        '현황공시': "공시 주체, 시기, 제출 서류를 구체적으로 안내하세요.",
-        '비상장사 중요사항': "공시 대상 거래, 기한, 제출 방법을 상세히 설명하세요."
-    }
-    
-    if category and category in category_instructions:
-        instruction_text += f"\n{category_instructions[category]}"
+    # 중요한 질문에 대한 특별 지시사항
+    if importance == 'critical':
+        extra_instructions = """
+특히 다음 사항들을 반드시 포함하세요:
+1. 정확한 법적 근거 (조항 명시)
+2. 구체적인 수치와 기한
+3. 주의사항 및 예외사항
+4. 실무 적용 시 확인해야 할 체크리스트"""
+    else:
+        extra_instructions = ""
     
     # 시스템 프롬프트
     system_prompt = f"""당신은 한국 공정거래위원회 전문가입니다.
@@ -1766,7 +1748,7 @@ async def generate_answer(query: str, results: List[SearchResult], stats: Dict) 
 3. 주의사항 또는 예외사항 (있는 경우)
 4. 실무 적용 시 권장사항 (필요한 경우)
 
-{instruction_text}
+{extra_instructions}
 
 중요: 구버전 정보가 포함된 경우, 반드시 최신 기준을 명시하세요."""
     
@@ -1781,7 +1763,7 @@ async def generate_answer(query: str, results: List[SearchResult], stats: Dict) 
 [질문]
 {query}
 
-{"간결하고 명확하게" if complexity == 'simple' else "상세하고 실무적으로"} 답변해주세요."""}
+{"정확하고 신중하게" if importance == 'critical' else "명확하고 실무적으로"} 답변해주세요."""}
     ]
     
     # API 호출 시작
@@ -1792,27 +1774,24 @@ async def generate_answer(query: str, results: List[SearchResult], stats: Dict) 
             model=model,
             messages=messages,
             temperature=temperature,
-            max_tokens=1500 if complexity == 'complex' else 1000
+            max_tokens=2000 if importance == 'critical' else 1500
         )
         
         answer = response.choices[0].message.content
         
-        # 토큰 사용량 추정
-        estimated_tokens = len(context) / 4 + len(answer) / 4
-        
-        # 비용 계산
-        cost = stats['selection_info']['estimated_cost']
-        
-        # 예산에 추가
-        budget_manager = BudgetManager()
-        budget_manager.add_usage(cost)
+        # 중요한 질문의 경우 품질 검증
+        if importance == 'critical':
+            validator = AnswerQualityValidator()
+            validation_result = validator.validate_answer(query, answer, QueryImportance.CRITICAL)
+            
+            if validation_result['needs_revision']:
+                logger.warning(f"Answer quality issues detected: {validation_result['issues']}")
+                # 필요시 재생성 로직 추가 가능
         
         generation_stats = {
             'generation_time': time.time() - api_start,
             'model': model,
-            'temperature': temperature,
-            'estimated_tokens': estimated_tokens,
-            'cost': cost
+            'temperature': temperature
         }
         
         return answer, generation_stats
@@ -1833,108 +1812,13 @@ async def generate_answer(query: str, results: List[SearchResult], stats: Dict) 
         return fallback_answer, {
             'generation_time': time.time() - api_start,
             'error': str(e),
-            'model': model,
-            'cost': 0
+            'model': model
         }
-
-# ===== 성능 시각화 함수들 =====
-def create_complexity_gauge(score: float) -> go.Figure:
-    """복잡도를 게이지 차트로 표시"""
-    fig = go.Figure(go.Indicator(
-        mode = "gauge+number+delta",
-        value = score,
-        domain = {'x': [0, 1], 'y': [0, 1]},
-        title = {'text': "질문 복잡도"},
-        delta = {'reference': 0.5},
-        gauge = {
-            'axis': {'range': [None, 1]},
-            'bar': {'color': "darkblue"},
-            'steps': [
-                {'range': [0, 0.3], 'color': "lightgreen"},
-                {'range': [0.3, 0.7], 'color': "yellow"},
-                {'range': [0.7, 1], 'color': "lightcoral"}
-            ],
-            'threshold': {
-                'line': {'color': "red", 'width': 4},
-                'thickness': 0.75,
-                'value': 0.85
-            }
-        }
-    ))
-    
-    fig.update_layout(height=200, margin=dict(l=20, r=20, t=40, b=20))
-    return fig
-
-def create_budget_pie_chart(used: float, remaining: float) -> go.Figure:
-    """예산 사용 현황을 파이 차트로 표시"""
-    fig = go.Figure(data=[go.Pie(
-        labels=['사용됨', '남음'],
-        values=[used, remaining],
-        hole=.3,
-        marker_colors=['#ff6b6b', '#51cf66'] if remaining > 0 else ['#ff6b6b', '#868e96']
-    )])
-    
-    fig.update_traces(
-        textposition='inside',
-        textinfo='percent+label',
-        hoverinfo='label+value+percent'
-    )
-    
-    fig.update_layout(
-        title=f"일일 예산 현황 (${used:.2f} / $50.00)",
-        height=300,
-        margin=dict(l=20, r=20, t=40, b=20),
-        showlegend=False
-    )
-    
-    return fig
-
-def create_model_usage_chart(usage_stats: Dict) -> go.Figure:
-    """모델별 사용 통계를 막대 차트로 표시"""
-    models = list(usage_stats.keys())
-    counts = [stats['count'] for stats in usage_stats.values()]
-    costs = [stats['total_cost'] for stats in usage_stats.values()]
-    
-    fig = go.Figure()
-    
-    # 사용 횟수
-    fig.add_trace(go.Bar(
-        name='사용 횟수',
-        x=models,
-        y=counts,
-        yaxis='y',
-        offsetgroup=1
-    ))
-    
-    # 총 비용
-    fig.add_trace(go.Bar(
-        name='총 비용 ($)',
-        x=models,
-        y=costs,
-        yaxis='y2',
-        offsetgroup=2
-    ))
-    
-    fig.update_layout(
-        title='모델별 사용 현황',
-        xaxis=dict(title='모델'),
-        yaxis=dict(title='사용 횟수', side='left'),
-        yaxis2=dict(title='비용 ($)', overlaying='y', side='right'),
-        hovermode='x unified',
-        height=300
-    )
-    
-    return fig
 
 # ===== 모델 및 데이터 로딩 =====
 @st.cache_resource(show_spinner=False)
 def load_models_and_data():
-    """필요한 모델과 데이터 로드
-    
-    이 함수는 시스템 시작 시 한 번만 실행되어
-    필요한 모든 구성 요소를 메모리에 로드합니다.
-    캐싱을 통해 재실행 시 빠르게 시작할 수 있습니다.
-    """
+    """필요한 모델과 데이터 로드"""
     try:
         # 필수 파일 확인
         required_files = ["manuals_vector_db.index", "all_manual_chunks.json"]
@@ -1982,11 +1866,7 @@ def load_models_and_data():
 
 # ===== 메인 UI =====
 def main():
-    """메인 애플리케이션 함수
-    
-    이 함수는 전체 사용자 인터페이스를 구성하고
-    사용자와의 상호작용을 관리합니다.
-    """
+    """메인 애플리케이션 함수"""
     
     # 헤더 표시
     st.markdown("""
@@ -2016,14 +1896,6 @@ def main():
     if "messages" not in st.session_state:
         st.session_state.messages = []
     
-    # 모델 사용 통계 초기화
-    if 'model_usage_stats' not in st.session_state:
-        st.session_state.model_usage_stats = {
-            'gpt-4o-mini': {'count': 0, 'total_cost': 0},
-            'o4-mini': {'count': 0, 'total_cost': 0},
-            'gpt-4o': {'count': 0, 'total_cost': 0}
-        }
-    
     # 채팅 컨테이너
     chat_container = st.container()
     
@@ -2048,28 +1920,30 @@ def main():
                             """, unsafe_allow_html=True)
                         
                         # 메타 정보 표시
-                        col1, col2, col3 = st.columns(3)
+                        col1, col2, col3, col4 = st.columns(4)
                         with col1:
                             model_used = message["content"].get("model_used", "unknown")
                             model_emoji = {
                                 'gpt-4o-mini': '🟢',
                                 'o4-mini': '🟡',
+                                'o3-mini': '🟠',
                                 'gpt-4o': '🔵'
                             }.get(model_used, '⚪')
                             st.caption(f"{model_emoji} {model_used}")
                         
                         with col2:
-                            cost = message["content"].get("cost", 0)
-                            if cost < 0.01:
-                                cost_class = "cost-saved"
-                            elif cost < 0.05:
-                                cost_class = "cost-normal"
-                            else:
-                                cost_class = "cost-high"
-                            st.caption(f'<span class="cost-efficiency {cost_class}">${cost:.4f}</span>', 
-                                     unsafe_allow_html=True)
+                            importance = message["content"].get("importance", "normal")
+                            importance_class = f"importance-{importance}"
+                            st.markdown(f'<span class="importance-indicator {importance_class}">{importance.upper()}</span>', 
+                                      unsafe_allow_html=True)
                         
                         with col3:
+                            complexity = message["content"].get("complexity", "unknown")
+                            complexity_class = f"complexity-{complexity}"
+                            st.markdown(f'<span class="complexity-indicator {complexity_class}">{complexity.upper()}</span>', 
+                                      unsafe_allow_html=True)
+                        
+                        with col4:
                             total_time = message["content"].get("total_time", 0)
                             st.caption(f"⏱️ {total_time:.1f}초")
                     else:
@@ -2128,44 +2002,57 @@ def main():
                     model_emoji = {
                         'gpt-4o-mini': '🟢',
                         'o4-mini': '🟡',
+                        'o3-mini': '🟠',
                         'gpt-4o': '🔵'
                     }.get(model_used, '⚪')
                     st.metric("모델", f"{model_emoji} {model_used}")
                 
                 with col2:
-                    cost = generation_stats.get('cost', 0)
-                    st.metric("비용", f"${cost:.4f}")
+                    st.metric("검색", f"{search_time:.1f}초")
                 
                 with col3:
-                    st.metric("검색", f"{search_time:.1f}초")
+                    st.metric("생성", f"{generation_time:.1f}초")
                 
                 with col4:
                     st.metric("전체", f"{total_time:.1f}초")
                 
-                # 복잡도 표시
+                # 중요도와 복잡도 표시
+                importance = search_stats.get('importance', 'normal')
                 complexity = search_stats.get('complexity', 'unknown')
-                complexity_html = f'<span class="complexity-indicator complexity-{complexity}">{complexity.upper()}</span>'
-                st.markdown(f"질문 복잡도: {complexity_html}", unsafe_allow_html=True)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    importance_html = f'<span class="importance-indicator importance-{importance}">중요도: {importance.upper()}</span>'
+                    st.markdown(importance_html, unsafe_allow_html=True)
+                
+                with col2:
+                    complexity_html = f'<span class="complexity-indicator complexity-{complexity}">복잡도: {complexity.upper()}</span>'
+                    st.markdown(complexity_html, unsafe_allow_html=True)
                 
                 # 상세 정보 (접을 수 있음)
                 with st.expander("🔍 상세 정보 보기"):
                     # 탭 구성
-                    tab1, tab2, tab3, tab4 = st.tabs(["📊 분석 과정", "📚 참고 자료", "🤖 AI 분석", "⚡ 성능 지표"])
+                    tab1, tab2, tab3 = st.tabs(["📊 분석 과정", "📚 참고 자료", "🤖 AI 분석"])
                     
                     with tab1:
-                        # 복잡도 게이지
-                        complexity_score = search_stats.get('complexity_analysis', {}).get('normalized_score', 0)
-                        fig = create_complexity_gauge(complexity_score)
-                        st.plotly_chart(fig, use_container_width=True)
+                        # 중요도 정보
+                        importance_info = search_stats.get('importance_info', {})
+                        if importance_info:
+                            st.subheader("🎯 중요도 평가")
+                            st.write(f"**중요도 점수**: {importance_info.get('score', 0)}")
+                            st.write("**평가 요인**:")
+                            for factor in importance_info.get('factors', []):
+                                st.write(f"  • {factor}")
                         
                         # 모델 선택 이유
-                        st.info(f"**선택 이유**: {search_stats.get('selection_info', {}).get('reason', 'N/A')}")
+                        selection_info = search_stats.get('selection_info', {})
+                        if selection_info:
+                            st.info(f"**모델 선택 이유**: {selection_info.get('reason', 'N/A')}")
                         
                         # 검색 전략
                         st.markdown("**검색 전략**")
                         st.json({
                             "접근 방식": search_stats.get('search_approach', 'N/A'),
-                            "검색 방법": search_stats.get('search_method', 'N/A'),
                             "검색된 청크 수": search_stats.get('searched_chunks', 0)
                         })
                     
@@ -2210,33 +2097,14 @@ def main():
                         if requirements.get('needs_timeline'):
                             req_text.append("✓ 시간 순서 필요")
                         st.write("\n".join(req_text) if req_text else "특별한 요구사항 없음")
-                    
-                    with tab4:
-                        # 성능 지표
-                        metrics_data = {
-                            "분석 시간": f"{search_stats.get('analysis_time', 0):.2f}초",
-                            "검색 시간": f"{search_time:.2f}초",
-                            "답변 생성 시간": f"{generation_time:.2f}초",
-                            "총 처리 시간": f"{total_time:.2f}초",
-                            "예상 토큰 수": generation_stats.get('estimated_tokens', 0),
-                            "온도 설정": generation_stats.get('temperature', 0)
-                        }
-                        
-                        for key, value in metrics_data.items():
-                            st.metric(key, value)
-                
-                # 모델 사용 통계 업데이트
-                if model_used in st.session_state.model_usage_stats:
-                    st.session_state.model_usage_stats[model_used]['count'] += 1
-                    st.session_state.model_usage_stats[model_used]['total_cost'] += cost
                 
                 # 응답 데이터 저장
                 response_data = {
                     "answer": answer,
                     "model_used": model_used,
-                    "cost": cost,
                     "total_time": total_time,
                     "complexity": complexity,
+                    "importance": importance,
                     "has_version_conflicts": search_stats.get('has_version_conflicts', False),
                     "search_stats": search_stats,
                     "generation_stats": generation_stats
@@ -2245,45 +2113,9 @@ def main():
     
     # 사이드바
     with st.sidebar:
-        st.header("💰 비용 관리 대시보드")
-        
-        # 예산 현황
-        budget_manager = BudgetManager()
-        budget_status = budget_manager.get_current_status()
-        
-        # 예산 상태 알림
-        if budget_status['budget_exhausted']:
-            st.error("⚠️ 일일 예산이 소진되었습니다!")
-        elif budget_status['is_budget_critical']:
-            st.warning("⚠️ 예산이 20% 미만 남았습니다!")
-        
-        # 파이 차트
-        fig = create_budget_pie_chart(budget_status['used'], budget_status['remaining'])
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # 모델별 사용 통계
-        st.subheader("📊 모델별 사용 현황")
-        
-        # 막대 차트
-        if any(stats['count'] > 0 for stats in st.session_state.model_usage_stats.values()):
-            fig = create_model_usage_chart(st.session_state.model_usage_stats)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("아직 사용 기록이 없습니다.")
-        
-        # 상세 통계 테이블
-        stats_df = pd.DataFrame(st.session_state.model_usage_stats).T
-        if not stats_df.empty:
-            stats_df.columns = ['사용 횟수', '총 비용($)']
-            stats_df['평균 비용($)'] = stats_df['총 비용($)'] / stats_df['사용 횟수'].replace(0, 1)
-            st.dataframe(stats_df.round(4))
-        
-        st.divider()
-        
-        # 예시 질문
         st.header("💡 예시 질문")
         
-        st.subheader("🟢 간단한 질문 (gpt-4o-mini)")
+        st.subheader("🟢 간단한 질문")
         example_simple = [
             "대규모내부거래 공시 기한은?",
             "이사회 의결 금액 기준은?",
@@ -2294,7 +2126,7 @@ def main():
                 st.session_state.new_question = example
                 st.rerun()
         
-        st.subheader("🟡 표준 질문 (o4-mini)")
+        st.subheader("🟡 표준 질문")
         example_standard = [
             "계열사와 자금거래 시 절차는?",
             "비상장사 주식 양도 시 필요한 서류는?",
@@ -2305,13 +2137,14 @@ def main():
                 st.session_state.new_question = example
                 st.rerun()
         
-        st.subheader("🔵 복잡한 질문")
-        example_complex = [
-            "A회사가 B계열사에 자금을 대여하면서 동시에 C계열사의 지분을 취득하는 경우 적용되는 규제는?",
+        st.subheader("🔵 중요한 질문")
+        example_important = [
+            "계열회사 A가 B에게 채권 500억원 규모를 매각하였습니다. 매각이익은 200억원 입니다. 공시대상은?",
+            "A회사가 B계열사에 100억원을 대여하면서 동시에 C계열사의 지분을 취득하는 경우 적용되는 규제는?",
             "여러 계열사와 동시에 거래할 때 검토해야 할 사항들을 종합적으로 설명해주세요"
         ]
-        for example in example_complex:
-            if st.button(example, key=f"complex_{example}"):
+        for example in example_important:
+            if st.button(example, key=f"important_{example}"):
                 st.session_state.new_question = example
                 st.rerun()
         
@@ -2320,15 +2153,16 @@ def main():
         # 시스템 정보
         with st.expander("ℹ️ 시스템 정보"):
             st.info("""
-            **모델 특성**
-            - 🟢 gpt-4o-mini: 가장 빠르고 경제적
-            - 🟡 o4-mini: 뛰어난 추론 능력 (주력)
-            - 🔵 gpt-4o: 특수한 경우에만 사용
+            **중요도 기반 모델 선택**
+            - 🔴 Critical: 대규모 금액, 법적 리스크 → gpt-4o
+            - 🟠 High: 중요한 법적 판단 → o3-mini/gpt-4o
+            - 🟢 Normal: 일반 질문 → gpt-4o-mini/o4-mini
             
-            **캐싱 정책**
-            - 간단한 질문은 자동 캐싱
-            - 유사한 질문은 캐시 활용
-            - 구버전 정보는 캐싱 제외
+            **질문 분석 프로세스**
+            1. 중요도 평가 (금액, 법적 리스크)
+            2. 복잡도 분석
+            3. 최적 모델 선택
+            4. 품질 보증
             """)
         
         # 리셋 버튼
