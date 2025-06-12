@@ -22,17 +22,6 @@ import gc
 import concurrent.futures
 from functools import lru_cache
 from datetime import datetime, timedelta
-import pickle
-
-# load_models_and_data 함수 내에 추가
-# BM25 인덱스 로드 (선택사항)
-try:
-    with open("bm25_index.pkl", "rb") as f:
-        bm25_index = pickle.load(f)
-    logger.info("Loaded BM25 index")
-except:
-    bm25_index = None
-    logger.warning("BM25 index not loaded")
     
 # ===== 로깅 설정 =====
 def setup_logging():
