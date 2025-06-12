@@ -1,45 +1,33 @@
-# ===== Core Dependencies =====
-# Streamlit과 기본 라이브러리
+# Python 3.13 호환 requirements.txt
+# 2025년 6월 기준 최신 버전들
+
+# Core
 streamlit>=1.31.0
 openai>=1.12.0
 
-# ===== Security and Utilities =====
-# 보안 및 유틸리티 라이브러리
-cryptography>=41.0.0  # API 키 암호화
-ijson>=3.2.0  # 대용량 JSON 스트리밍 (선택적)
-nest-asyncio>=1.5.8  # 비동기 처리 개선
-
-# ===== Data Processing =====
-# NumPy는 버전을 명시적으로 지정 (Python 3.13 호환성)
-numpy==1.24.3
-pandas>=1.5.3,<2.0.0
+# Data processing - Python 3.13 호환 버전
+numpy>=1.26.0  # Python 3.13 지원
+pandas>=2.1.0  # 최신 NumPy와 호환
 scikit-learn>=1.3.0
 
-# ===== Vector Search =====
-# FAISS CPU 버전
-faiss-cpu==1.7.4
+# Security and utilities
+cryptography>=41.0.0
+nest-asyncio>=1.5.8
 
-# ===== Deep Learning =====
-# PyTorch CPU 버전 (메모리 절약 및 호환성)
---find-links https://download.pytorch.org/whl/torch_stable.html
-torch==2.0.1+cpu
-torchvision==0.15.2+cpu
+# 선택적 - FAISS가 Python 3.13을 지원하지 않을 수 있음
+# faiss-cpu는 제외
 
-# ===== NLP Models =====
-# Sentence Transformers와 관련 라이브러리
-sentence-transformers>=2.2.2
-transformers>=4.30.0,<5.0.0
-tokenizers>=0.13.3
+# 선택적 - sentence-transformers도 문제가 있을 수 있음
+# 필요시 주석 해제
+# sentence-transformers>=2.2.2
+# transformers>=4.30.0
+# torch>=2.0.0
 
-# ===== Additional Dependencies =====
-# 추가 필수 라이브러리
-regex>=2023.0.0
+# 필수 유틸리티
+scipy>=1.11.0
 tqdm>=4.65.0
-typing-extensions>=4.5.0
+regex>=2023.8.8
 filelock>=3.12.0
-huggingface-hub>=0.16.0
 
-# ===== Optional but Recommended =====
-# 성능 개선을 위한 선택적 라이브러리
-scipy>=1.10.0
-nltk>=3.8.0
+# 타입 힌트
+typing-extensions>=4.7.0
