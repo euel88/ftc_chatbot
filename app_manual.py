@@ -895,6 +895,9 @@ class AdaptiveQueryAnalyzer:
         """
         
         try:
+            # 모델별 temperature 설정
+            analysis_temperature = 1.0 if analysis_model in ['o1-mini', 'o3-mini', 'o4-mini'] else 0
+            
             response = openai.chat.completions.create(
                 model=analysis_model,
                 messages=[{"role": "user", "content": prompt}],
@@ -1671,6 +1674,10 @@ def determine_temperature(query: str, complexity: str, model: str, importance: s
     중요한 질문일수록 낮은 temperature를 사용하여
     일관되고 정확한 답변을 생성합니다.
     """
+    # 새로운 모델들은 temperature=1만 지원
+    if model in ['o1-mini', 'o3-mini', 'o4-mini']:
+        return 1.0
+        
     query_lower = query.lower()
     
     # 중요도별 기본 temperature
