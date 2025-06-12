@@ -1,8 +1,19 @@
-streamlit
-sentence-transformers
-faiss-cpu
-numpy
-openai
-pandas
-torch>=1.9.0
-transformers>=4.20.0
+# Streamlit - UI 프레임워크
+streamlit>=1.28.0
+
+# AI/ML 관련
+sentence-transformers>=2.2.2
+faiss-cpu>=1.7.4
+numpy>=1.24.0
+openai>=1.0.0
+torch>=1.13.0
+transformers>=4.30.0
+
+# 데이터 처리 및 시각화
+pandas>=2.0.0
+plotly>=5.17.0  # 이 줄이 누락되어 있었습니다!
+
+# 유틸리티
+python-dotenv>=1.0.0
+
+# 기본 파이썬 버전: 3.8-3.11 권장
