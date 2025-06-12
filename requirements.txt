@@ -17,3 +17,7 @@ plotly>=5.17.0  # 이 줄이 누락되어 있었습니다!
 python-dotenv>=1.0.0
 
 # 기본 파이썬 버전: 3.8-3.11 권장
+
+# 기존 requirements.txt에 추가
+konlpy>=0.6.0  # 한국어 형태소 분석기
+rank-bm25>=0.2.2  # BM25 알고리즘
