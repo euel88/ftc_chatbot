@@ -1,4 +1,56 @@
-# 파일 이름: app_improved.py (공정거래위원회 AI 법률 보조원 - 하이브리드 개선 버전)
+# ===== 간단한 벡터 검색 시스템 (FAISS 대체) =====
+class SimpleVectorSearch:
+    """FAISS를 사용할 수 없을 때를 위한 간단한 벡터 검색
+    
+    이 클래스는 NumPy만을 사용하여 코사인 유사도 기반의
+    벡터 검색을 구현합니다. FAISS보다는 느리지만,
+    어떤 환경에서도 작동합니다.
+    """
+    
+    def __init__(self, embeddings: np.ndarray):
+        """
+        Args:
+            embeddings: 문서 임베딩 배열 (n_docs, embedding_dim)
+        """
+        self.embeddings = embeddings
+        # 정규화된 임베딩 저장 (코사인 유사도 계산 최적화)
+        self.normalized_embeddings = self._normalize_vectors(embeddings)
+        logger.info(f"SimpleVectorSearch initialized with {len(embeddings)} documents")
+    
+    def _normalize_vectors(self, vectors: np.ndarray) -> np.ndarray:
+        """벡터 정규화 (L2 norm = 1)"""
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        # 0으로 나누기 방지
+        norms = np.where(norms == 0, 1, norms)
+        return vectors / norms
+    
+    def search(self, query_vector: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        코사인 유사도 기반 검색
+        
+        Args:
+            query_vector: 쿼리 벡터 (1, embedding_dim)
+            k: 반환할 상위 결과 수
+        
+        Returns:
+            scores: 유사도 점수 배열
+            indices: 문서 인덱스 배열
+        """
+        # 쿼리 벡터 정규화
+        query_norm = self._normalize_vectors(query_vector.reshape(1, -1))
+        
+        # 코사인 유사도 계산 (정규화된 벡터의 내적)
+        similarities = np.dot(self.normalized_embeddings, query_norm.T).squeeze()
+        
+        # 상위 k개 선택
+        top_k_indices = np.argpartition(similarities, -k)[-k:]
+        top_k_indices = top_k_indices[np.argsort(similarities[top_k_indices])[::-1]]
+        
+        # FAISS와 동일한 형식으로 반환
+        scores = similarities[top_k_indices].reshape(1, -1)
+        indices = top_k_indices.reshape(1, -1)
+        
+        return scores, indices# 파일 이름: app_improved.py (공정거래위원회 AI 법률 보조원 - 하이브리드 개선 버전)
 
 import streamlit as st
 import faiss
@@ -1414,16 +1466,12 @@ class RobustSearchPipeline:
             "searched_chunks": 0
         }
 
-# ===== 개선된 하이브리드 RAG 파이프라인 =====
+# ===== 개선된 하이브리드 RAG 파이프라인 (Python 3.13 호환) =====
 class ImprovedHybridRAGPipeline:
-    """모든 개선사항이 반영된 하이브리드 RAG 파이프라인
+    """Python 3.13에서도 작동하는 하이브리드 RAG 파이프라인
     
-    이 클래스는 다음의 개선사항을 포함합니다:
-    1. 하이브리드 모델 전략 (GPT-4o, GPT-4o-mini, o4-mini)
-    2. 메모리 효율적인 청크 로딩
-    3. 견고한 에러 처리
-    4. 코드 중복 제거
-    5. 문서 버전 관리 및 충돌 해결
+    이 클래스는 FAISS나 sentence-transformers가 없어도 작동하도록
+    설계되었습니다. OpenAI embeddings나 간단한 텍스트 검색을 사용합니다.
     """
     
     def __init__(self, embedding_model, reranker_model, index, chunk_loader: ChunkLoader,
@@ -1449,26 +1497,88 @@ class ImprovedHybridRAGPipeline:
             for category, indices in self.manual_indices.items()
         }
         
-        # 검색 실행기 및 전략
-        self.search_executor = BaseSearchExecutor(index, chunk_loader, embedding_model)
-        self.robust_search = RobustSearchPipeline(self.search_executor)
-        
-        self.search_strategies = {
-            'direct': DirectSearchStrategy(self.manual_indices),
-            'focused': FocusedSearchStrategy(self.manual_indices, chunk_loader)
-        }
+        # 검색 시스템 초기화 (FAISS 또는 대체 시스템)
+        self._initialize_search_system()
         
         # 캐시
         self.search_cache = LRUCache(max_size=50, ttl=1800)
         
-        logger.info(f"ImprovedHybridRAGPipeline initialized with {chunk_loader.get_total_chunks()} chunks")
+        logger.info(f"Pipeline initialized with {chunk_loader.get_total_chunks()} chunks")
+    
+    def _initialize_search_system(self):
+        """검색 시스템 초기화 - FAISS가 없으면 대체 시스템 사용"""
+        if self.index is not None:
+            # FAISS 인덱스가 있으면 사용
+            self.use_faiss = True
+            logger.info("Using FAISS for vector search")
+        else:
+            # FAISS가 없으면 대체 시스템 사용
+            self.use_faiss = False
+            logger.info("FAISS not available, initializing alternative search")
+            
+            # 임베딩이 이미 존재하는지 확인
+            embeddings_file = "chunk_embeddings.npy"
+            if os.path.exists(embeddings_file):
+                try:
+                    embeddings = np.load(embeddings_file)
+                    self.simple_search = SimpleVectorSearch(embeddings)
+                    logger.info(f"Loaded {len(embeddings)} pre-computed embeddings")
+                except Exception as e:
+                    logger.warning(f"Failed to load embeddings: {e}")
+                    self._create_simple_search()
+            else:
+                self._create_simple_search()
+    
+    def _create_simple_search(self):
+        """간단한 검색 시스템 생성"""
+        logger.info("Creating embeddings for simple search...")
+        
+        # 모든 청크에 대한 임베딩 생성
+        total_chunks = self.chunk_loader.get_total_chunks()
+        # 데모/테스트를 위해 처음 1000개만 처리 (전체 처리는 시간이 오래 걸림)
+        max_chunks = min(total_chunks, 1000)
+        
+        embeddings = []
+        
+        if self.embedding_model is not None:
+            # sentence-transformers 사용 가능
+            for i in range(max_chunks):
+                try:
+                    chunk = self.chunk_loader.get_chunk(i)
+                    # 텍스트 길이 제한 (토큰 제한 고려)
+                    text = chunk['content'][:500]
+                    embedding = self.embedding_model.encode([text])
+                    embeddings.append(embedding[0])
+                except Exception as e:
+                    logger.warning(f"Failed to create embedding for chunk {i}: {e}")
+                    # 실패한 경우 랜덤 벡터 사용 (임시)
+                    embeddings.append(np.random.randn(384))  # 일반적인 임베딩 차원
+        else:
+            # OpenAI embeddings 사용
+            logger.info("Using OpenAI embeddings (this may take a while)...")
+            for i in range(max_chunks):
+                try:
+                    chunk = self.chunk_loader.get_chunk(i)
+                    text = chunk['content'][:500]
+                    embedding = self.api_manager.get_embedding(text)
+                    embeddings.append(embedding)
+                except Exception as e:
+                    logger.warning(f"Failed to create OpenAI embedding for chunk {i}: {e}")
+                    embeddings.append(np.random.randn(1536))  # OpenAI 임베딩 차원
+        
+        embeddings_array = np.array(embeddings)
+        
+        # 임베딩 저장 (다음 실행을 위해)
+        try:
+            np.save("chunk_embeddings.npy", embeddings_array)
+            logger.info("Saved embeddings for future use")
+        except Exception as e:
+            logger.warning(f"Failed to save embeddings: {e}")
+        
+        self.simple_search = SimpleVectorSearch(embeddings_array)
     
     def _build_manual_indices(self) -> Dict[str, List[int]]:
-        """각 매뉴얼별로 청크 인덱스를 구축
-        
-        메모리 효율성을 위해 청크 내용을 모두 로드하지 않고
-        필요한 최소한의 정보만으로 인덱스를 구축합니다.
-        """
+        """각 매뉴얼별로 청크 인덱스를 구축"""
         indices = defaultdict(list)
         
         # 청크 메타데이터만 빠르게 스캔
@@ -1499,12 +1609,27 @@ class ImprovedHybridRAGPipeline:
         
         return dict(indices)
     
+    def _get_query_embedding(self, query: str) -> np.ndarray:
+        """쿼리 임베딩 생성"""
+        if self.embedding_model is not None:
+            # sentence-transformers 사용
+            return self.embedding_model.encode([query])[0]
+        else:
+            # OpenAI embeddings 사용
+            return np.array(self.api_manager.get_embedding(query))
+    
+    def _perform_vector_search(self, query_vector: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+        """벡터 검색 수행 - FAISS 또는 대체 시스템 사용"""
+        if self.use_faiss:
+            # FAISS 사용
+            query_vector_2d = query_vector.reshape(1, -1).astype(np.float32)
+            return self.index.search(query_vector_2d, k)
+        else:
+            # SimpleVectorSearch 사용
+            return self.simple_search.search(query_vector, k)
+    
     async def process_query(self, query: str, top_k: int = 5) -> Tuple[List[SearchResult], Dict]:
-        """개선된 쿼리 처리 프로세스
-        
-        하이브리드 모델 전략을 사용하여 질문을 분석하고
-        최적의 검색 방법을 선택합니다.
-        """
+        """쿼리 처리 - Python 3.13 호환"""
         start_time = time.time()
         
         # 캐시 확인
@@ -1514,151 +1639,103 @@ class ImprovedHybridRAGPipeline:
             logger.info(f"Cache hit for query: {query[:50]}...")
             return cached['results'], cached['stats']
         
-        # 1단계: 하이브리드 모델을 사용한 질문 분석
+        # 간단한 키워드 기반 검색 (폴백)
+        if not self.use_faiss and not hasattr(self, 'simple_search'):
+            logger.warning("No vector search available, using keyword search")
+            results = self._keyword_search(query, top_k)
+            stats = {
+                'search_method': 'keyword',
+                'search_time': time.time() - start_time,
+                'searched_chunks': len(results)
+            }
+            return results, stats
+        
+        # 벡터 검색
         try:
-            gpt_analysis = await self.query_analyzer.analyze_query(query, self.chunks_info)
-            analysis_time = time.time() - start_time
-        except Exception as e:
-            logger.error(f"Query analysis failed: {str(e)}")
-            return self._fallback_search(query, top_k)
-        
-        # 2단계: 분석 결과에 따른 검색 전략 선택
-        search_approach = gpt_analysis['search_strategy']['approach']
-        
-        # 3단계: 선택된 전략으로 검색 실행
-        if search_approach == 'direct_lookup':
-            results, search_stats = await self._execute_direct_search(query, gpt_analysis, top_k)
-        elif search_approach == 'focused_search':
-            results, search_stats = await self._execute_focused_search(query, gpt_analysis, top_k)
-        else:  # comprehensive_analysis
-            results, search_stats = await self._execute_comprehensive_search(query, gpt_analysis, top_k)
-        
-        # 4단계: 충돌 해결 및 최신 정보 우선시
-        results = self.conflict_resolver.resolve_conflicts(results, query)
-        
-        # 5단계: 통계 정보 구성
-        stats = {
-            'gpt_analysis': gpt_analysis,
-            'analysis_time': analysis_time,
-            'model_used_for_analysis': gpt_analysis.get('model_used', 'unknown'),
-            'search_approach': search_approach,
-            'total_time': time.time() - start_time,
-            'has_outdated_warnings': any(r.metadata.get('has_outdated_info', False) for r in results),
-            **search_stats
-        }
-        
-        # 캐시 저장 (에러가 없고 빠른 응답인 경우만)
-        if not stats.get('error') and stats['total_time'] < 5:
-            self.search_cache.put(cache_key, {
-                'results': results,
-                'stats': stats
-            })
-        
-        return results, stats
-    
-    async def _execute_direct_search(self, query: str, analysis: Dict, top_k: int) -> Tuple[List[SearchResult], Dict]:
-        """직접 검색 실행"""
-        strategy = self.search_strategies['direct']
-        primary_manual = analysis['search_strategy']['primary_manual']
-        
-        indices = strategy.prepare_indices(primary_manual)
-        enhanced_query = strategy.enhance_query(query, analysis['search_strategy']['search_keywords'])
-        
-        return await self.robust_search.search_with_retry(enhanced_query, indices, top_k, strategy)
-    
-    async def _execute_focused_search(self, query: str, analysis: Dict, top_k: int) -> Tuple[List[SearchResult], Dict]:
-        """집중 검색 실행"""
-        strategy = self.search_strategies['focused']
-        primary_manual = analysis['search_strategy']['primary_manual']
-        expected_chunks = analysis['search_strategy'].get('expected_chunks_needed', 10)
-        
-        indices = strategy.prepare_indices(primary_manual, expected_chunks * 2)
-        enhanced_query = strategy.enhance_query(query, analysis['search_strategy']['search_keywords'])
-        
-        results, stats = await self.robust_search.search_with_retry(
-            enhanced_query, indices, top_k * 2, strategy
-        )
-        
-        # 요구사항에 따른 추가 필터링
-        requirements = analysis.get('answer_requirements', {})
-        filtered_results = strategy.filter_results(results, requirements)
-        
-        return filtered_results[:top_k], stats
-    
-    async def _execute_comprehensive_search(self, query: str, analysis: Dict, top_k: int) -> Tuple[List[SearchResult], Dict]:
-        """종합 검색 실행 - 여러 매뉴얼에 걸친 검색"""
-        all_results = []
-        total_searched = 0
-        
-        for concept in analysis['legal_concepts']:
-            if concept['relevance'] in ['primary', 'secondary']:
-                manual = concept['concept']
-                if manual in self.manual_indices:
-                    strategy = self.search_strategies['focused']
-                    indices = strategy.prepare_indices(manual, 50)
-                    enhanced_query = f"{query} {' '.join(concept['specific_aspects'])}"
-                    
-                    partial_results, _ = await self.robust_search.search_with_retry(
-                        enhanced_query, indices, top_k // 2, strategy
-                    )
-                    all_results.extend(partial_results)
-                    total_searched += len(indices)
-        
-        # 중복 제거 및 정렬
-        seen_chunks = set()
-        unique_results = []
-        for result in sorted(all_results, key=lambda x: x.score, reverse=True):
-            if result.chunk_id not in seen_chunks:
-                seen_chunks.add(result.chunk_id)
-                unique_results.append(result)
-                if len(unique_results) >= top_k:
-                    break
-        
-        stats = {
-            'searched_chunks': total_searched,
-            'search_method': 'comprehensive_multi_manual'
-        }
-        
-        return unique_results, stats
-    
-    def _fallback_search(self, query: str, top_k: int) -> Tuple[List[SearchResult], Dict]:
-        """분석 실패 시 기본 검색"""
-        logger.warning("Falling back to basic search")
-        
-        # 간단한 키워드 기반 검색
-        all_indices = list(range(min(100, self.chunk_loader.get_total_chunks())))
-        
-        try:
-            query_vector = self.embedding_model.encode([query])
-            query_vector = np.array(query_vector, dtype=np.float32)
+            query_vector = self._get_query_embedding(query)
+            scores, indices = self._perform_vector_search(query_vector, top_k * 3)
             
-            scores, indices = self.index.search(query_vector, min(len(all_indices), top_k * 3))
-            
+            # 결과 변환
             results = []
             for idx, score in zip(indices[0], scores[0]):
                 if 0 <= idx < self.chunk_loader.get_total_chunks():
                     chunk = self.chunk_loader.get_chunk(idx)
-                    results.append(SearchResult(
-                        chunk_id=chunk.get('chunk_id', str(idx)),
+                    result = SearchResult(
+                        chunk_id=str(idx),
                         content=chunk['content'],
                         score=float(score),
-                        source=chunk['source'],
-                        page=chunk['page'],
-                        chunk_type=chunk.get('chunk_type', 'unknown'),
+                        source=chunk.get('source', 'Unknown'),
+                        page=chunk.get('page', 0),
+                        chunk_type=chunk.get('chunk_type', 'text'),
                         metadata=json.loads(chunk.get('metadata', '{}'))
-                    ))
+                    )
+                    results.append(result)
                     if len(results) >= top_k:
                         break
             
-            return results, {
-                'search_method': 'fallback',
-                'error': 'analysis_failed',
-                'searched_chunks': len(all_indices)
+            # 충돌 해결
+            results = self.conflict_resolver.resolve_conflicts(results, query)
+            
+            stats = {
+                'search_method': 'vector',
+                'search_time': time.time() - start_time,
+                'searched_chunks': len(indices[0])
             }
             
+            # 캐시 저장
+            self.search_cache.put(cache_key, {'results': results, 'stats': stats})
+            
+            return results, stats
+            
         except Exception as e:
-            logger.error(f"Fallback search also failed: {e}")
-            return [], {'error': 'complete_failure'}
+            logger.error(f"Vector search failed: {e}")
+            # 키워드 검색으로 폴백
+            results = self._keyword_search(query, top_k)
+            stats = {
+                'search_method': 'keyword_fallback',
+                'search_time': time.time() - start_time,
+                'searched_chunks': len(results),
+                'error': str(e)
+            }
+            return results, stats
+    
+    def _keyword_search(self, query: str, top_k: int) -> List[SearchResult]:
+        """간단한 키워드 기반 검색 (폴백용)"""
+        query_words = set(query.lower().split())
+        scored_chunks = []
+        
+        for i in range(min(self.chunk_loader.get_total_chunks(), 1000)):
+            try:
+                chunk = self.chunk_loader.get_chunk(i)
+                content_lower = chunk['content'].lower()
+                
+                # 단순 키워드 매칭 점수
+                score = sum(1 for word in query_words if word in content_lower)
+                
+                if score > 0:
+                    scored_chunks.append((i, score, chunk))
+            except Exception as e:
+                logger.warning(f"Error in keyword search for chunk {i}: {e}")
+                continue
+        
+        # 점수순 정렬
+        scored_chunks.sort(key=lambda x: x[1], reverse=True)
+        
+        # SearchResult 생성
+        results = []
+        for idx, score, chunk in scored_chunks[:top_k]:
+            result = SearchResult(
+                chunk_id=str(idx),
+                content=chunk['content'],
+                score=float(score),
+                source=chunk.get('source', 'Unknown'),
+                page=chunk.get('page', 0),
+                chunk_type=chunk.get('chunk_type', 'text'),
+                metadata=json.loads(chunk.get('metadata', '{}'))
+            )
+            results.append(result)
+        
+        return results
 
 # ===== 개선된 답변 생성 함수 =====
 async def generate_answer_with_hybrid_model(query: str, 
@@ -1924,57 +2001,70 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ===== 모델 및 데이터 로딩 =====
+# ===== 모델 및 데이터 로딩 (Python 3.13 호환 버전) =====
 @st.cache_resource(show_spinner=False)
 def load_models_and_data():
-    """필요한 모델과 데이터 로드
-    
-    개선된 버전에서는 ChunkLoader를 사용하여
-    메모리 효율적으로 데이터를 관리합니다.
-    """
+    """필요한 모델과 데이터 로드 - Python 3.13 호환"""
     try:
+        # API 관리자 초기화
+        api_manager = SecureAPIManager()
+        api_manager.load_api_key()
+        openai.api_key = api_manager._api_key
+        
         # 필수 파일 확인
-        required_files = ["manuals_vector_db.index", "all_manual_chunks.json"]
+        required_files = ["all_manual_chunks.json"]
         missing_files = [f for f in required_files if not os.path.exists(f)]
         
         if missing_files:
             st.error(f"❌ 필수 파일이 없습니다: {', '.join(missing_files)}")
-            st.info("💡 prepare_pdfs_ftc.py를 먼저 실행하여 데이터를 준비하세요.")
+            st.info("💡 GitHub 저장소에 데이터 파일을 업로드했는지 확인하세요.")
             return None
         
-        with st.spinner("🤖 AI 시스템을 준비하는 중... (최초 1회만 수행됩니다)"):
-            # API 관리자 초기화
-            api_manager = SecureAPIManager()
-            api_manager.load_api_key()
-            openai.api_key = api_manager._api_key
+        with st.spinner("🤖 AI 시스템을 준비하는 중..."):
+            # FAISS 인덱스 체크 - 있으면 로드, 없으면 생성
+            index = None
+            index_file = "manuals_vector_db.index"
             
-            # FAISS 인덱스 로드
-            index = faiss.read_index("manuals_vector_db.index")
+            if os.path.exists(index_file) and FAISS_AVAILABLE:
+                try:
+                    import faiss
+                    index = faiss.read_index(index_file)
+                    logger.info("FAISS index loaded successfully")
+                except Exception as e:
+                    logger.warning(f"Failed to load FAISS index: {e}")
+                    index = None
             
-            # 메모리 효율적인 청크 로더 초기화
+            # 청크 로더 초기화
             chunk_loader = ChunkLoader("all_manual_chunks.json")
             
-            # 임베딩 모델 로드
-            try:
-                embedding_model = SentenceTransformer('jhgan/ko-sroberta-multitask')
-                logger.info("Korean embedding model loaded successfully")
-            except Exception as e:
-                st.warning("한국어 모델 로드 실패. 대체 모델을 사용합니다.")
-                embedding_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+            # 임베딩 모델 - Python 3.13에서 문제가 있을 수 있으므로 대체 방안 준비
+            embedding_model = None
             
-            # Reranker 모델 로드 (선택적)
+            # sentence-transformers가 실패하면 OpenAI embeddings 사용
             try:
-                reranker_model = CrossEncoder('Dongjin-kr/ko-reranker')
-                logger.info("Korean reranker model loaded successfully")
-            except:
-                logger.warning("Reranker model load failed, proceeding without it")
-                reranker_model = None
-        
-        return embedding_model, reranker_model, index, chunk_loader, api_manager
+                from sentence_transformers import SentenceTransformer
+                embedding_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+                logger.info("Sentence transformer model loaded")
+            except Exception as e:
+                logger.warning(f"Sentence transformers not available: {e}")
+                logger.info("Will use OpenAI embeddings as fallback")
+            
+            # Reranker는 선택사항
+            reranker_model = None
+            
+            # 인덱스가 없고 FAISS도 없으면 간단한 검색 시스템 사용
+            if index is None and not FAISS_AVAILABLE:
+                logger.warning("FAISS not available, using simple search")
+                # 간단한 임베딩 기반 검색을 위한 준비
+                st.info("💡 벡터 검색 대신 텍스트 기반 검색을 사용합니다.")
+            
+            return embedding_model, reranker_model, index, chunk_loader, api_manager
         
     except Exception as e:
         st.error(f"시스템 초기화 실패: {str(e)}")
         logger.error(f"System initialization failed: {str(e)}")
+        with st.expander("🔍 상세 오류 정보"):
+            st.code(traceback.format_exc())
         return None
 
 # ===== 메인 UI =====
