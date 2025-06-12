@@ -23,8 +23,29 @@ import concurrent.futures
 from functools import lru_cache, wraps
 import pickle
 from pathlib import Path
-from cryptography.fernet import Fernet
-import ijson  # 스트리밍 JSON 파서를 위해 필요
+
+# 선택적 import - 없어도 앱이 실행되도록 처리
+try:
+    from cryptography.fernet import Fernet
+    CRYPTOGRAPHY_AVAILABLE = True
+except ImportError:
+    CRYPTOGRAPHY_AVAILABLE = False
+    logging.warning("cryptography module not available - encryption features disabled")
+
+try:
+    import ijson
+    IJSON_AVAILABLE = True
+except ImportError:
+    IJSON_AVAILABLE = False
+    logging.warning("ijson module not available - using standard JSON loading")
+
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+    NEST_ASYNCIO_AVAILABLE = True
+except ImportError:
+    NEST_ASYNCIO_AVAILABLE = False
+    logging.warning("nest_asyncio not available - async features may be limited")
 
 # ===== 로깅 설정 =====
 def setup_logging():
@@ -104,8 +125,8 @@ class SecureAPIManager:
     """API 키와 호출을 안전하게 관리하는 클래스
     
     이 클래스는 API 키의 안전한 저장과 로드, 그리고 API 호출의 
-    속도 제한 및 비용 추적을 담당합니다. 프로덕션 환경에서의 
-    보안과 비용 관리를 위해 필수적입니다.
+    속도 제한 및 비용 추적을 담당합니다. Streamlit Cloud 환경에
+    최적화되어 있습니다.
     """
     
     def __init__(self):
@@ -132,13 +153,13 @@ class SecureAPIManager:
         """API 키를 안전하게 로드
         
         우선순위:
-        1. Streamlit secrets (개발 환경)
-        2. 환경 변수 (프로덕션 환경)
-        3. 암호화된 파일 (고급 보안 환경)
+        1. Streamlit secrets (개발/프로덕션 환경)
+        2. 환경 변수 (로컬 테스트)
+        3. 암호화된 파일 (고급 보안 - 선택적)
         """
-        # Streamlit secrets 확인
+        # Streamlit secrets 확인 (최우선)
         try:
-            if 'st' in globals() and hasattr(st, 'secrets') and 'OPENAI_API_KEY' in st.secrets:
+            if 'OPENAI_API_KEY' in st.secrets:
                 self._api_key = st.secrets["OPENAI_API_KEY"]
                 logger.info("API key loaded from Streamlit secrets")
                 return self._api_key
@@ -151,10 +172,11 @@ class SecureAPIManager:
             logger.info("API key loaded from environment variable")
             return self._api_key
         
-        # 암호화된 파일 확인 (프로덕션용)
-        encrypted_key_path = Path('.api_key.enc')
-        if encrypted_key_path.exists():
-            try:
+        # 암호화된 파일 확인 (선택적 - cryptography 모듈이 있을 때만)
+        try:
+            from cryptography.fernet import Fernet
+            encrypted_key_path = Path('.api_key.enc')
+            if encrypted_key_path.exists():
                 cipher_key = os.environ.get('API_CIPHER_KEY')
                 if cipher_key:
                     cipher = Fernet(cipher_key.encode())
@@ -163,10 +185,12 @@ class SecureAPIManager:
                     self._api_key = cipher.decrypt(encrypted_key).decode()
                     logger.info("API key loaded from encrypted file")
                     return self._api_key
-            except Exception as e:
-                logger.error(f"Failed to decrypt API key: {e}")
+        except ImportError:
+            logger.debug("cryptography module not available, skipping encrypted file option")
+        except Exception as e:
+            logger.error(f"Failed to decrypt API key: {e}")
         
-        raise APIKeyError("API 키를 찾을 수 없습니다. Streamlit secrets, 환경 변수, 또는 암호화된 파일을 확인하세요.")
+        raise APIKeyError("API 키를 찾을 수 없습니다. Streamlit secrets 또는 환경 변수를 확인하세요.")
     
     def rate_limit(self, model: str = 'gpt-4o'):
         """API 호출 속도 제한 데코레이터
@@ -236,151 +260,133 @@ class SecureAPIManager:
 class ChunkLoader:
     """메모리 효율적인 청크 로딩 시스템
     
-    이 클래스는 대용량 JSON 파일을 전체 메모리에 로드하지 않고
-    필요한 부분만 스트리밍 방식으로 읽을 수 있게 합니다.
-    수 GB의 문서도 효율적으로 처리할 수 있습니다.
+    이 클래스는 대용량 JSON 파일을 효율적으로 처리합니다.
+    ijson이 있으면 스트리밍 방식을, 없으면 일반 방식을 사용합니다.
     """
     
     def __init__(self, filepath: str):
         self.filepath = filepath
-        self._index = None
-        self._chunk_cache = OrderedDict()  # LRU 캐시
-        self._cache_size = 1000  # 캐시할 청크 수
-        self._build_index()
-    
-    def _build_index(self):
-        """청크의 파일 내 위치를 인덱싱
+        self._chunks = None
+        self._chunk_cache = OrderedDict()
+        self._cache_size = 1000
+        self._use_streaming = False
         
-        이 메서드는 파일을 한 번 스캔하여 각 청크의 시작 위치를 기록합니다.
-        이후 특정 청크를 읽을 때 해당 위치로 직접 이동할 수 있습니다.
-        """
-        logger.info(f"Building index for {self.filepath}")
+        # ijson 사용 가능 여부 확인
+        try:
+            import ijson
+            self._use_streaming = True
+            logger.info("Using streaming JSON parser (ijson)")
+        except ImportError:
+            self._use_streaming = False
+            logger.info("ijson not available, using standard JSON loading")
+        
+        self._initialize()
+    
+    def _initialize(self):
+        """초기화 - 스트리밍 또는 일반 방식 선택"""
+        if self._use_streaming:
+            try:
+                self._build_streaming_index()
+            except Exception as e:
+                logger.warning(f"Streaming index failed: {e}, falling back to standard loading")
+                self._use_streaming = False
+                self._load_all_chunks()
+        else:
+            self._load_all_chunks()
+    
+    def _load_all_chunks(self):
+        """전체 청크를 메모리에 로드 (폴백 방식)"""
+        logger.info(f"Loading all chunks from {self.filepath}")
+        try:
+            with open(self.filepath, 'r', encoding='utf-8') as f:
+                self._chunks = json.load(f)
+            logger.info(f"Loaded {len(self._chunks)} chunks into memory")
+        except Exception as e:
+            logger.error(f"Failed to load chunks: {e}")
+            self._chunks = []
+    
+    def _build_streaming_index(self):
+        """스트리밍 방식으로 인덱스 구축 (ijson 필요)"""
+        import ijson
+        logger.info(f"Building streaming index for {self.filepath}")
         self._index = {}
         
         with open(self.filepath, 'rb') as f:
-            # 배열의 시작 '[' 찾기
-            while True:
-                char = f.read(1)
-                if char == b'[':
-                    break
-            
-            # 각 청크의 위치 기록
-            idx = 0
-            bracket_count = 0
-            in_string = False
-            escape_next = False
-            chunk_start = f.tell()
-            
-            while True:
-                char = f.read(1)
-                if not char:
-                    break
-                
-                if escape_next:
-                    escape_next = False
-                    continue
-                
-                if char == b'\\':
-                    escape_next = True
-                    continue
-                
-                if char == b'"' and not escape_next:
-                    in_string = not in_string
-                
-                if not in_string:
-                    if char == b'{':
-                        if bracket_count == 0:
-                            chunk_start = f.tell() - 1
-                        bracket_count += 1
-                    elif char == b'}':
-                        bracket_count -= 1
-                        if bracket_count == 0:
-                            self._index[idx] = chunk_start
-                            idx += 1
+            parser = ijson.items(f, 'item')
+            for idx, item in enumerate(parser):
+                # 인덱스만 저장하고 실제 데이터는 나중에 로드
+                self._index[idx] = idx
         
-        logger.info(f"Index built: {len(self._index)} chunks found")
+        logger.info(f"Streaming index built: {len(self._index)} chunks found")
     
     def get_chunk(self, idx: int) -> Dict:
-        """특정 인덱스의 청크를 가져옴
-        
-        캐시를 먼저 확인하고, 없으면 파일에서 읽습니다.
-        LRU 캐시를 사용하여 자주 사용되는 청크는 메모리에 유지합니다.
-        """
+        """특정 인덱스의 청크를 가져옴"""
         # 캐시 확인
         if idx in self._chunk_cache:
-            # LRU: 최근 사용 항목을 끝으로 이동
             self._chunk_cache.move_to_end(idx)
             return self._chunk_cache[idx]
         
-        # 인덱스 확인
-        if idx not in self._index:
-            raise IndexError(f"Chunk index {idx} not found")
+        # 스트리밍 방식이 아니면 메모리에서 직접 반환
+        if not self._use_streaming:
+            if self._chunks and 0 <= idx < len(self._chunks):
+                chunk = self._chunks[idx]
+                self._add_to_cache(idx, chunk)
+                return chunk
+            else:
+                raise IndexError(f"Chunk index {idx} out of range")
         
-        # 파일에서 청크 읽기
-        with open(self.filepath, 'rb') as f:
-            f.seek(self._index[idx])
-            
-            # 청크 파싱
-            chunk_str = ''
-            bracket_count = 0
-            in_string = False
-            escape_next = False
-            
-            while True:
-                char = f.read(1).decode('utf-8', errors='ignore')
-                if not char:
-                    break
-                
-                chunk_str += char
-                
-                if escape_next:
-                    escape_next = False
-                    continue
-                
-                if char == '\\':
-                    escape_next = True
-                    continue
-                
-                if char == '"' and not escape_next:
-                    in_string = not in_string
-                
-                if not in_string:
-                    if char == '{':
-                        bracket_count += 1
-                    elif char == '}':
-                        bracket_count -= 1
-                        if bracket_count == 0:
-                            break
-            
-            chunk = json.loads(chunk_str)
-            
-            # 캐시에 저장
-            self._add_to_cache(idx, chunk)
-            
-            return chunk
+        # 스트리밍 방식으로 특정 청크 로드
+        try:
+            import ijson
+            with open(self.filepath, 'rb') as f:
+                parser = ijson.items(f, 'item')
+                for i, item in enumerate(parser):
+                    if i == idx:
+                        self._add_to_cache(idx, item)
+                        return item
+            raise IndexError(f"Chunk index {idx} not found")
+        except Exception as e:
+            logger.error(f"Failed to load chunk {idx}: {e}")
+            # 폴백: 전체 로드 시도
+            if not self._chunks:
+                self._load_all_chunks()
+            if self._chunks and 0 <= idx < len(self._chunks):
+                return self._chunks[idx]
+            raise
     
     def _add_to_cache(self, idx: int, chunk: Dict):
         """캐시에 청크 추가 (LRU 정책)"""
         if len(self._chunk_cache) >= self._cache_size:
-            # 가장 오래된 항목 제거
             self._chunk_cache.popitem(last=False)
-        
         self._chunk_cache[idx] = chunk
     
     def iter_chunks(self, indices: List[int] = None) -> Iterator[Dict]:
-        """필요한 청크들을 순차적으로 반환
-        
-        메모리 효율성을 위해 제너레이터를 사용합니다.
-        """
-        if indices is None:
-            indices = range(len(self._index))
-        
-        for idx in indices:
-            yield self.get_chunk(idx)
+        """필요한 청크들을 순차적으로 반환"""
+        if not self._use_streaming and self._chunks:
+            # 메모리에 로드된 경우
+            if indices is None:
+                indices = range(len(self._chunks))
+            for idx in indices:
+                if 0 <= idx < len(self._chunks):
+                    yield self._chunks[idx]
+        else:
+            # 스트리밍 방식
+            if indices is None:
+                indices = range(self.get_total_chunks())
+            for idx in indices:
+                yield self.get_chunk(idx)
     
     def get_total_chunks(self) -> int:
         """전체 청크 수 반환"""
-        return len(self._index)
+        if not self._use_streaming and self._chunks:
+            return len(self._chunks)
+        elif hasattr(self, '_index'):
+            return len(self._index)
+        else:
+            # 카운트를 위해 한 번 스캔
+            if not self._chunks:
+                self._load_all_chunks()
+            return len(self._chunks) if self._chunks else 0
 
 # ===== 타입 정의 =====
 class ModelSelection(Enum):
@@ -1187,18 +1193,21 @@ class ConflictResolver:
                     'correct_value': '100억원'
                 })
         
-        # 공시 기한 충돌 확인
+        # 공시 기한 명확성 확인 (충돌이 아닌 명확성 체크로 변경)
         if 'deadlines' in critical_info:
-            deadline_values = set()
+            unclear_deadlines = []
             for item in critical_info['deadlines']:
                 if '공시' in item['context'] and '의결' in item['context']:
-                    deadline_values.add(item['value'])
+                    # 영업일 명시 여부 확인
+                    if '영업일' not in item['context']:
+                        unclear_deadlines.append(item['value'])
             
-            if len(deadline_values) > 1 and '7일' in deadline_values:
+            if unclear_deadlines:
                 conflicts.append({
-                    'type': 'deadline_conflict',
-                    'values': list(deadline_values),
-                    'correct_value': '5일'
+                    'type': 'deadline_clarity',
+                    'values': list(unclear_deadlines),
+                    'correct_value': '영업일 7일',
+                    'issue': '영업일 기준임을 명시해야 함'
                 })
         
         return conflicts
@@ -1214,13 +1223,17 @@ class ConflictResolver:
                         results[i].metadata['score_reduced'] = True
                         results[i].metadata['reduction_reason'] = 'outdated_amount'
             
-            elif conflict['type'] == 'deadline_conflict':
-                # 구버전 기한이 포함된 결과의 점수 감소
+            elif conflict['type'] == 'deadline_clarity':
+                # 영업일이 명시되지 않은 결과의 점수 약간 감소
                 for i, result in enumerate(results):
-                    if '7일' in result.content and '공시' in result.content:
-                        results[i].score *= 0.7
-                        results[i].metadata['score_reduced'] = True
-                        results[i].metadata['reduction_reason'] = 'outdated_deadline'
+                    deadline_match = re.search(r'의결.*?(\d+)\s*일.*?공시', result.content)
+                    if deadline_match:
+                        context = result.content[max(0, deadline_match.start()-50):deadline_match.end()+50]
+                        if '영업일' not in context:
+                            results[i].score *= 0.85  # 점수를 15% 감소
+                            results[i].metadata['score_reduced'] = True
+                            results[i].metadata['reduction_reason'] = 'unclear_deadline_specification'
+                            results[i].metadata['clarification_needed'] = '영업일 기준임을 명시 필요'
         
         return results
 
@@ -1706,7 +1719,7 @@ async def generate_answer_with_hybrid_model(query: str,
 {query}
 
 [추가 고려사항]
-- 최신 개정사항 반영 (대규모내부거래 기준: 100억원, 공시기한: 5일)
+- 최신 개정사항 반영 (대규모내부거래 기준: 100억원, 공시기한: 영업일 7일)
 - 상충하는 정보가 있다면 최신 정보를 우선시
 - 불확실한 부분은 명시적으로 표현"""
         
@@ -1767,14 +1780,32 @@ async def generate_answer_with_hybrid_model(query: str,
 
 # ===== 비동기 실행 헬퍼 =====
 def run_async_in_streamlit(coro):
-    """Streamlit 환경에서 비동기 함수를 안전하게 실행"""
+    """Streamlit 환경에서 비동기 함수를 안전하게 실행
+    
+    Streamlit Cloud는 이미 이벤트 루프를 실행하고 있을 수 있으므로,
+    더 안전한 방식으로 비동기 코드를 처리합니다.
+    """
     try:
-        loop = asyncio.get_running_loop()
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(asyncio.run, coro)
-            return future.result()
-    except RuntimeError:
-        return asyncio.run(coro)
+        # 먼저 현재 이벤트 루프가 있는지 확인
+        try:
+            loop = asyncio.get_running_loop()
+            # 이벤트 루프가 있다면 태스크로 실행
+            import nest_asyncio
+            nest_asyncio.apply()
+            return asyncio.run(coro)
+        except RuntimeError:
+            # 이벤트 루프가 없다면 새로 생성
+            return asyncio.run(coro)
+    except Exception as e:
+        logger.error(f"Async execution failed: {str(e)}")
+        # 최후의 수단: 동기적으로 실행 시도
+        import inspect
+        if inspect.iscoroutine(coro):
+            # 코루틴을 강제로 실행
+            try:
+                return asyncio.new_event_loop().run_until_complete(coro)
+            except:
+                raise RuntimeError(f"Failed to execute async function: {str(e)}")
 
 # ===== 페이지 설정 및 스타일링 =====
 st.set_page_config(
