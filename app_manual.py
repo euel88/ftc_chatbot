@@ -899,7 +899,7 @@ class AdaptiveQueryAnalyzer:
                 model=analysis_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
-                max_tokens=1000,
+                max_completion_tokens=1000,
                 response_format={"type": "json_object"}
             )
             
@@ -1774,7 +1774,7 @@ async def generate_answer(query: str, results: List[SearchResult], stats: Dict) 
             model=model,
             messages=messages,
             temperature=temperature,
-            max_tokens=2000 if importance == 'critical' else 1500
+            max_completion_tokens=2000 if importance == 'critical' else 1500
         )
         
         answer = response.choices[0].message.content
