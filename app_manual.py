@@ -1,4 +1,4 @@
-# 파일 이름: app_manual.py (공정거래위원회 AI 법률 보조원 - 완전 수정 버전)
+# 파일 이름: app_manual.py (공정거래위원회 AI 법률 보조원 - 최적화 버전)
 
 import streamlit as st
 import faiss
@@ -8,7 +8,7 @@ import openai
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Set, TypedDict, Protocol, Iterator, Generator, OrderedDict, Any, Union
 import re
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, OrderedDict
 import time
 from dataclasses import dataclass, field
 import os
@@ -21,8 +21,14 @@ import traceback
 import gc
 import concurrent.futures
 from functools import lru_cache
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime, timedelta
 
 # ===== 로깅 설정 =====
+# 로깅은 시스템의 작동 상황을 기록하는 일기장과 같습니다.
+# 문제가 발생했을 때 원인을 찾거나 성능을 개선하는 데 도움이 됩니다.
 def setup_logging():
     """구조화된 로깅 시스템 설정"""
     logger = logging.getLogger('ftc_chatbot')
@@ -32,12 +38,12 @@ def setup_logging():
         '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
     )
     
-    # 파일 핸들러
+    # 파일 핸들러 - 로그를 파일에 저장
     file_handler = logging.FileHandler('ftc_chatbot_debug.log')
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     
-    # 콘솔 핸들러
+    # 콘솔 핸들러 - 개발 중 확인용
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
@@ -51,6 +57,8 @@ def setup_logging():
 logger = setup_logging()
 
 # ===== 사용자 정의 예외 클래스 =====
+# 예외 클래스는 프로그램에서 발생할 수 있는 다양한 오류 상황을 
+# 체계적으로 관리하기 위한 도구입니다.
 class RAGPipelineError(Exception):
     """RAG 파이프라인의 기본 예외 클래스"""
     pass
@@ -63,14 +71,19 @@ class EmbeddingError(RAGPipelineError):
     """임베딩 생성 관련 오류"""
     pass
 
-class GPTAnalysisError(RAGPipelineError):
-    """GPT 분석 실패 관련 오류"""
+class ModelSelectionError(RAGPipelineError):
+    """모델 선택 관련 오류"""
     pass
 
 # ===== 에러 컨텍스트 매니저 =====
 @contextmanager
 def error_context(operation_name: str, fallback_value=None):
-    """에러 처리를 위한 컨텍스트 매니저"""
+    """
+    에러 처리를 위한 컨텍스트 매니저
+    
+    이는 마치 안전망과 같아서, 작업 중 문제가 발생해도
+    프로그램이 완전히 중단되지 않고 적절히 대응할 수 있게 합니다.
+    """
     try:
         logger.debug(f"Starting operation: {operation_name}")
         yield
@@ -95,7 +108,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# CSS 스타일
+# CSS 스타일 - UI를 보기 좋게 만드는 디자인 설정
 st.markdown("""
 <style>
     /* Streamlit 기본 요소 숨기기 */
@@ -166,6 +179,30 @@ st.markdown("""
         background-color: #f8d7da;
         color: #721c24;
     }
+    
+    /* 비용 효율성 표시 */
+    .cost-efficiency {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.8rem;
+        margin-left: 4px;
+    }
+    
+    .cost-saved {
+        background-color: #d4edda;
+        color: #155724;
+    }
+    
+    .cost-normal {
+        background-color: #e2e3e5;
+        color: #383d41;
+    }
+    
+    .cost-high {
+        background-color: #f8d7da;
+        color: #721c24;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -177,6 +214,7 @@ except:
     st.stop()
 
 # ===== 타입 정의 =====
+# 타입 정의는 데이터의 구조를 명확히 하여 코드의 안정성을 높입니다.
 class ChunkDict(TypedDict):
     """청크 데이터의 타입 정의"""
     chunk_id: str
@@ -187,11 +225,11 @@ class ChunkDict(TypedDict):
     metadata: str
 
 class AnalysisResult(TypedDict):
-    """GPT 분석 결과의 타입 정의"""
+    """분석 결과의 타입 정의"""
     query_analysis: dict
-    legal_concepts: list
+    complexity_score: float
+    recommended_model: str
     search_strategy: dict
-    answer_requirements: dict
 
 # ===== 데이터 구조 정의 =====
 @dataclass
@@ -209,11 +247,6 @@ class SearchResult:
     def document_date(self) -> Optional[str]:
         """문서의 작성/개정 날짜 반환"""
         return self.metadata.get('document_date') or self.metadata.get('revision_date')
-    
-    @property
-    def is_latest(self) -> bool:
-        """최신 자료 여부 확인"""
-        return self.metadata.get('is_latest', False)
 
 class QueryComplexity(Enum):
     """질문 복잡도 레벨"""
@@ -223,11 +256,16 @@ class QueryComplexity(Enum):
 
 # ===== LRU 캐시 구현 =====
 class LRUCache:
-    """시간 기반 만료를 지원하는 LRU 캐시 구현"""
+    """
+    시간 기반 만료를 지원하는 LRU 캐시 구현
+    
+    캐시는 자주 사용되는 데이터를 메모리에 보관하여
+    반복적인 계산을 피하고 성능을 향상시키는 기술입니다.
+    """
     def __init__(self, max_size: int = 100, ttl: int = 3600):
         self.cache = OrderedDict()
         self.max_size = max_size
-        self.ttl = ttl
+        self.ttl = ttl  # Time To Live (초 단위)
         
     def get(self, key: str):
         """캐시에서 값을 가져오고, 만료된 항목은 제거"""
@@ -239,6 +277,7 @@ class LRUCache:
             del self.cache[key]
             return None
             
+        # 최근 사용된 항목을 끝으로 이동
         self.cache.move_to_end(key)
         return value
         
@@ -247,6 +286,7 @@ class LRUCache:
         if key in self.cache:
             del self.cache[key]
             
+        # 캐시가 가득 차면 가장 오래된 항목 제거
         if len(self.cache) >= self.max_size:
             self.cache.popitem(last=False)
             
@@ -264,7 +304,12 @@ class LRUCache:
 
 # ===== 비동기 실행 헬퍼 =====
 def run_async_in_streamlit(coro):
-    """Streamlit 환경에서 비동기 함수를 안전하게 실행"""
+    """
+    Streamlit 환경에서 비동기 함수를 안전하게 실행
+    
+    Streamlit은 기본적으로 동기적으로 작동하므로,
+    비동기 함수를 실행하려면 특별한 처리가 필요합니다.
+    """
     try:
         loop = asyncio.get_running_loop()
         with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -273,480 +318,384 @@ def run_async_in_streamlit(coro):
     except RuntimeError:
         return asyncio.run(coro)
 
-# ===== 문서 버전 관리 =====
-class DocumentVersionManager:
-    """문서의 버전과 최신성을 관리하는 시스템"""
+# ===== 비용 관리 시스템 =====
+class BudgetManager:
+    """
+    API 사용 비용을 추적하고 관리하는 시스템
+    
+    이는 마치 가계부를 작성하는 것과 같아서,
+    얼마나 사용했고 얼마나 남았는지를 항상 파악할 수 있게 합니다.
+    """
+    def __init__(self, daily_budget: float = 50.0):
+        self.daily_budget = daily_budget
+        self.reset_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # 모델별 비용 정보 (1M 토큰당 달러)
+        self.model_costs = {
+            'gpt-4o-mini': {
+                'input': 0.15,
+                'cached': 0.075,
+                'output': 0.60
+            },
+            'o4-mini': {
+                'input': 1.10,
+                'cached': 0.275,
+                'output': 4.40
+            },
+            'gpt-4o': {
+                'input': 2.50,
+                'cached': 1.25,
+                'output': 10.00
+            }
+        }
+    
+    def calculate_cost(self, model: str, input_tokens: int, 
+                      output_tokens: int, cached: bool = False) -> float:
+        """토큰 수를 기반으로 비용 계산"""
+        costs = self.model_costs[model]
+        input_cost = costs['cached' if cached else 'input'] * (input_tokens / 1_000_000)
+        output_cost = costs['output'] * (output_tokens / 1_000_000)
+        return input_cost + output_cost
+    
+    def get_current_status(self) -> Dict:
+        """현재 예산 상황 반환"""
+        # 세션 상태에서 오늘의 사용량 가져오기
+        if 'daily_cost' not in st.session_state:
+            st.session_state.daily_cost = 0.0
+            
+        # 날짜가 바뀌었으면 리셋
+        current_date = datetime.now().date()
+        if 'last_reset_date' not in st.session_state:
+            st.session_state.last_reset_date = current_date
+        elif st.session_state.last_reset_date != current_date:
+            st.session_state.daily_cost = 0.0
+            st.session_state.last_reset_date = current_date
+            
+        used = st.session_state.daily_cost
+        remaining = self.daily_budget - used
+        
+        return {
+            'used': used,
+            'remaining': remaining,
+            'remaining_ratio': remaining / self.daily_budget,
+            'is_budget_critical': remaining < self.daily_budget * 0.2
+        }
+    
+    def add_usage(self, cost: float):
+        """사용 비용 추가"""
+        st.session_state.daily_cost = st.session_state.get('daily_cost', 0.0) + cost
+
+# ===== 모델 선택 시스템 =====
+class SimplifiedModelSelector:
+    """
+    세 가지 모델(gpt-4o-mini, o4-mini, gpt-4o)만을 사용하는 
+    단순화되고 효율적인 모델 선택 시스템
+    
+    이 시스템은 마치 의사가 환자의 증상을 보고 
+    적절한 검사를 결정하는 것과 같이 작동합니다.
+    """
     
     def __init__(self):
-        self.regulation_changes = {
-            '대규모내부거래_금액기준': [
-                {'date': '2023-01-01', 'old_value': '50억원', 'new_value': '100억원',
-                 'description': '자본금 및 자본총계 중 큰 금액의 5% 이상 또는 100억원 이상'},
-                {'date': '2020-01-01', 'old_value': '30억원', 'new_value': '50억원',
-                 'description': '자본금 및 자본총계 중 큰 금액의 5% 이상 또는 50억원 이상'}
-            ],
-            '공시_기한': [
-                {'date': '2022-07-01', 'old_value': '7일', 'new_value': '5일',
-                 'description': '이사회 의결 후 공시 기한 단축'}
-            ]
+        self.model_profiles = {
+            'gpt-4o-mini': {
+                'cost_per_1k': 0.00015,
+                'strengths': ['speed', 'simple_queries', 'fact_checking'],
+                'max_tokens': 2000,
+                'decision_threshold': 0.3,
+                'performance_score': 0.6
+            },
+            'o4-mini': {
+                'cost_per_1k': 0.0011,
+                'strengths': ['reasoning', 'analysis', 'multi_step'],
+                'max_tokens': 4000,
+                'decision_threshold': 0.85,
+                'performance_score': 0.85  # 추론 능력이 뛰어남
+            },
+            'gpt-4o': {
+                'cost_per_1k': 0.0025,
+                'strengths': ['long_context', 'creative', 'fallback'],
+                'max_tokens': 8000,
+                'decision_threshold': 0.95,
+                'performance_score': 0.75  # o4-mini보다 비싸지만 추론은 약함
+            }
         }
         
-        self.critical_patterns = {
-            '금액': r'(\d+)억\s*원',
-            '비율': r'(\d+(?:\.\d+)?)\s*%',
-            '기한': r'(\d+)\s*일',
-            '날짜': r'(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일'
-        }
-    
-    def extract_document_date(self, chunk: Dict) -> Optional[str]:
-        """문서에서 작성/개정 날짜 추출"""
-        content = chunk.get('content', '')
-        metadata = json.loads(chunk.get('metadata', '{}'))
+        self.budget_manager = BudgetManager()
         
-        if 'document_date' in metadata:
-            return metadata['document_date']
+    def select_model(self, query: str, initial_assessment: Dict) -> Tuple[str, Dict]:
+        """
+        질문에 가장 적합한 모델을 선택합니다.
         
-        date_patterns = [
-            r'(\d{4})년\s*(\d{1,2})월\s*개정',
-            r'시행일\s*:\s*(\d{4})년\s*(\d{1,2})월',
-            r'(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})',
-        ]
+        선택 과정은 다음과 같습니다:
+        1. 질문의 복잡도를 평가
+        2. 현재 예산 상황 확인
+        3. 각 모델의 강점과 비용을 고려하여 최적 선택
+        """
         
-        for pattern in date_patterns:
-            match = re.search(pattern, content)
-            if match:
-                return self._normalize_date(match.group(0))
+        # 질문의 특성을 점수화 (0~1)
+        complexity_score = self._calculate_complexity_score(query, initial_assessment)
         
-        return None
-    
-    def _normalize_date(self, date_str: str) -> str:
-        """날짜 문자열을 표준 형식으로 변환"""
-        date_str = re.sub(r'[^\d]', '-', date_str)
-        parts = date_str.split('-')
-        if len(parts) >= 2:
-            year = parts[0] if len(parts[0]) == 4 else '20' + parts[0]
-            month = parts[1].zfill(2)
-            day = parts[2].zfill(2) if len(parts) > 2 else '01'
-            return f"{year}-{month}-{day}"
-        return None
-    
-    def check_for_outdated_info(self, content: str, document_date: str = None) -> List[Dict]:
-        """구버전 정보가 포함되어 있는지 확인"""
-        warnings = []
+        # 현재 예산 상황
+        budget_status = self.budget_manager.get_current_status()
         
-        amount_match = re.search(r'(\d+)억\s*원.*대규모내부거래', content)
-        if amount_match:
-            amount = int(amount_match.group(1))
-            if amount == 50:
-                warnings.append({
-                    'type': 'outdated_amount',
-                    'found': '50억원',
-                    'current': '100억원',
-                    'regulation': '대규모내부거래 금액 기준',
-                    'changed_date': '2023-01-01',
-                    'severity': 'critical'
-                })
-            elif amount == 30:
-                warnings.append({
-                    'type': 'outdated_amount',
-                    'found': '30억원',
-                    'current': '100억원',
-                    'regulation': '대규모내부거래 금액 기준',
-                    'changed_date': '2023-01-01',
-                    'severity': 'critical'
-                })
-        
-        return warnings
-
-# ===== 충돌 해결 시스템 =====
-class ConflictResolver:
-    """상충하는 정보를 해결하는 시스템"""
-    
-    def __init__(self, version_manager: DocumentVersionManager):
-        self.version_manager = version_manager
-    
-    def resolve_conflicts(self, results: List[SearchResult], query: str) -> List[SearchResult]:
-        """검색 결과 중 상충하는 정보를 해결하고 최신 정보를 우선시"""
-        
-        for result in results:
-            doc_date = result.document_date
-            warnings = self.version_manager.check_for_outdated_info(result.content, doc_date)
+        # 명확한 규칙 기반 선택
+        if complexity_score < self.model_profiles['gpt-4o-mini']['decision_threshold']:
+            selected_model = 'gpt-4o-mini'
+            reason = "간단한 사실 확인 또는 정의 질문"
             
-            if warnings:
-                result.metadata['warnings'] = warnings
-                result.metadata['has_outdated_info'] = True
+        elif complexity_score < self.model_profiles['o4-mini']['decision_threshold']:
+            selected_model = 'o4-mini'
+            reason = "추론과 분석이 필요한 표준 질문"
+            
+        else:
+            # 특별한 경우를 확인
+            if self._requires_long_context(query):
+                selected_model = 'gpt-4o'
+                reason = "긴 문맥 처리가 필요한 특수 케이스"
+            elif self._is_creative_task(query):
+                selected_model = 'gpt-4o'
+                reason = "창의적 해석이 필요한 특수 케이스"
             else:
-                result.metadata['has_outdated_info'] = False
+                # 대부분의 복잡한 질문도 o4-mini가 더 효과적
+                selected_model = 'o4-mini'
+                reason = "복잡하지만 o4-mini의 추론 능력으로 충분"
         
-        critical_info = self._extract_critical_info(results, query)
-        if critical_info:
-            conflicts = self._find_conflicts(critical_info)
-            if conflicts:
-                results = self._prioritize_latest_info(results, conflicts)
+        # 예산이 부족한 경우 하위 모델로 대체
+        if budget_status['is_budget_critical']:
+            if selected_model == 'gpt-4o':
+                selected_model = 'o4-mini'
+                reason += " (예산 제약으로 대체)"
+            elif selected_model == 'o4-mini' and budget_status['remaining_ratio'] < 0.1:
+                selected_model = 'gpt-4o-mini'
+                reason += " (예산 제약으로 대체)"
         
-        results.sort(key=lambda r: (
-            not r.metadata.get('has_outdated_info', False),
-            r.document_date or '1900-01-01',
-            r.score
-        ), reverse=True)
+        selection_info = {
+            'model': selected_model,
+            'reason': reason,
+            'complexity_score': complexity_score,
+            'budget_remaining': budget_status['remaining_ratio'],
+            'estimated_cost': self._estimate_query_cost(selected_model)
+        }
         
-        return results
+        return selected_model, selection_info
     
-    def _extract_critical_info(self, results: List[SearchResult], query: str) -> Dict:
-        """결과에서 중요 정보 추출"""
-        critical_info = defaultdict(list)
+    def _calculate_complexity_score(self, query: str, assessment: Dict) -> float:
+        """
+        질문의 복잡도를 0에서 1 사이의 점수로 계산합니다.
         
-        for i, result in enumerate(results):
-            amounts = re.findall(r'(\d+)억\s*원', result.content)
-            for amount in amounts:
-                critical_info['amounts'].append({
-                    'value': amount + '억원',
-                    'result_index': i,
-                    'context': result.content[:100]
-                })
+        복잡도 평가 요소:
+        - 질문의 길이
+        - 특정 키워드의 존재
+        - 문장 구조의 복잡성
+        - 여러 주체나 조건의 언급
+        """
+        score = 0.0
+        
+        # 길이 기반 점수 (0~0.3)
+        query_length = len(query)
+        if query_length < 50:
+            score += 0.1
+        elif query_length < 150:
+            score += 0.2
+        else:
+            score += 0.3
             
-            percentages = re.findall(r'(\d+(?:\.\d+)?)\s*%', result.content)
-            for pct in percentages:
-                critical_info['percentages'].append({
-                    'value': pct + '%',
-                    'result_index': i,
-                    'context': result.content[:100]
-                })
+        # 키워드 기반 점수 (0~0.4)
+        complex_keywords = ['만약', '경우', '동시에', '여러', '비교', '분석', '전략', '종합적']
+        keyword_count = sum(1 for keyword in complex_keywords if keyword in query)
+        score += min(keyword_count * 0.1, 0.4)
         
-        return dict(critical_info)
-    
-    def _find_conflicts(self, critical_info: Dict) -> List[Dict]:
-        """중요 정보 간 충돌 찾기"""
-        conflicts = []
-        
-        if 'amounts' in critical_info:
-            amount_values = set()
-            for item in critical_info['amounts']:
-                if '대규모내부거래' in item['context']:
-                    amount_values.add(item['value'])
+        # 구조적 복잡도 (0~0.3)
+        if '?' in query and query.count('?') > 1:
+            score += 0.1
+        if any(conj in query for conj in ['그리고', '또한', '하지만', '그러나']):
+            score += 0.1
+        if re.search(r'[A-Z].*[A-Z]', query):  # 여러 주체가 언급됨
+            score += 0.1
             
-            if len(amount_values) > 1 and ('50억원' in amount_values or '30억원' in amount_values):
-                conflicts.append({
-                    'type': 'amount_conflict',
-                    'values': list(amount_values),
-                    'correct_value': '100억원'
-                })
-        
-        return conflicts
+        return min(score, 1.0)
     
-    def _prioritize_latest_info(self, results: List[SearchResult], conflicts: List[Dict]) -> List[SearchResult]:
-        """충돌이 있을 때 최신 정보를 우선시"""
-        for conflict in conflicts:
-            if conflict['type'] == 'amount_conflict':
-                for i, result in enumerate(results):
-                    if any(old_val in result.content for old_val in ['50억원', '30억원']):
-                        results[i].score *= 0.5
-                        results[i].metadata['score_reduced'] = True
-                        results[i].metadata['reduction_reason'] = 'outdated_amount'
-        
-        return results
+    def _requires_long_context(self, query: str) -> bool:
+        """긴 문맥 처리가 필요한지 판단"""
+        return len(query) > 1000 or '전체' in query or '모든' in query
+    
+    def _is_creative_task(self, query: str) -> bool:
+        """창의적 작업인지 판단"""
+        creative_keywords = ['시나리오', '스토리', '창의', '제안', '아이디어']
+        return any(keyword in query for keyword in creative_keywords)
+    
+    def _estimate_query_cost(self, model: str) -> float:
+        """질문 처리 예상 비용"""
+        avg_tokens = 3000  # 평균 토큰 수
+        return self.model_profiles[model]['cost_per_1k'] * (avg_tokens / 1000) * 2  # 입출력 모두 고려
 
-# ===== GPT-4o 질문 분석기 =====
-class GPT4oQueryAnalyzer:
-    """GPT-4o를 활용한 통합 질문 분석 및 검색 전략 수립"""
+# ===== 캐싱 전략 시스템 =====
+class SmartCacheStrategy:
+    """
+    모델별 특성을 고려한 지능형 캐싱 전략
+    
+    캐싱은 마치 자주 찾는 책을 책상 위에 올려놓는 것과 같아서,
+    반복적인 질문에 대해 빠르고 저렴하게 답변할 수 있게 합니다.
+    """
+    
+    def __init__(self):
+        self.cache_configs = {
+            'gpt-4o-mini': {
+                'ttl': 7200,  # 2시간 - 저렴하므로 오래 보관
+                'similarity_threshold': 0.85,
+                'cache_benefit_ratio': 0.5  # 50% 비용 절감
+            },
+            'o4-mini': {
+                'ttl': 3600,  # 1시간
+                'similarity_threshold': 0.9,
+                'cache_benefit_ratio': 0.75  # 75% 비용 절감
+            },
+            'gpt-4o': {
+                'ttl': 2400,  # 40분
+                'similarity_threshold': 0.92,
+                'cache_benefit_ratio': 0.5
+            }
+        }
+        
+        self.query_cache = LRUCache(max_size=200, ttl=7200)
+        self.embedding_cache = LRUCache(max_size=500, ttl=10800)
+    
+    def should_use_cache(self, query: str, model: str, 
+                        similar_cached_query: Optional[Dict]) -> bool:
+        """캐시 사용 여부를 결정"""
+        if not similar_cached_query:
+            return False
+        
+        config = self.cache_configs[model]
+        
+        # 유사도가 임계값을 넘는지 확인
+        similarity = similar_cached_query.get('similarity', 0)
+        if similarity < config['similarity_threshold']:
+            return False
+        
+        # 캐시 나이 확인
+        cache_age = time.time() - similar_cached_query.get('timestamp', 0)
+        if cache_age > config['ttl']:
+            return False
+        
+        return True
+    
+    def get_cached_result(self, query: str) -> Optional[Dict]:
+        """캐시된 결과 반환"""
+        # 정확히 일치하는 질문 먼저 확인
+        cache_key = hashlib.md5(query.encode()).hexdigest()
+        exact_match = self.query_cache.get(cache_key)
+        if exact_match:
+            return exact_match
+        
+        # 유사한 질문 찾기 (실제로는 더 정교한 유사도 계산 필요)
+        # 여기서는 간단한 예시만 제공
+        return None
+    
+    def store_result(self, query: str, result: Dict, model: str):
+        """결과를 캐시에 저장"""
+        cache_key = hashlib.md5(query.encode()).hexdigest()
+        result['cached_at'] = time.time()
+        result['model'] = model
+        self.query_cache.put(cache_key, result)
+
+# ===== 질문 분석기 =====
+class EnhancedQueryAnalyzer:
+    """
+    GPT-4o-mini를 활용한 효율적인 질문 분석기
+    
+    이 클래스는 질문을 분석하여 어떤 정보가 필요한지,
+    어떻게 검색해야 하는지를 파악합니다.
+    """
     
     def __init__(self):
         self.analysis_cache = LRUCache(max_size=100, ttl=3600)
-    
-    def analyze_and_strategize(self, query: str, available_chunks_info: Dict) -> Dict:
-        """GPT-4o로 질문을 분석하고 최적의 검색 전략 수립"""
         
-        cache_data = f"{query}_{json.dumps(available_chunks_info, sort_keys=True)}"
-        cache_key = hashlib.md5(cache_data.encode()).hexdigest()
+    async def analyze_query(self, query: str) -> Dict:
+        """질문을 분석하고 검색 전략 수립"""
         
-        cached_analysis = self.analysis_cache.get(cache_key)
-        if cached_analysis:
-            logger.info(f"Cache hit for query analysis: {query[:50]}...")
-            return cached_analysis
+        # 캐시 확인
+        cache_key = hashlib.md5(query.encode()).hexdigest()
+        cached = self.analysis_cache.get(cache_key)
+        if cached:
+            return cached
         
         prompt = f"""
-        당신은 공정거래법 전문가입니다. 다음 질문을 분석하고 최적의 검색 전략을 수립해주세요.
+        당신은 공정거래법 전문가입니다. 다음 질문을 분석해주세요.
         
         질문: {query}
         
-        사용 가능한 문서 정보:
-        - 대규모내부거래 매뉴얼: {available_chunks_info.get('대규모내부거래', 0)}개 청크
-        - 현황공시 매뉴얼: {available_chunks_info.get('현황공시', 0)}개 청크
-        - 비상장사 중요사항 매뉴얼: {available_chunks_info.get('비상장사 중요사항', 0)}개 청크
-        
         다음 형식의 JSON으로 응답해주세요:
         {{
-            "query_analysis": {{
-                "core_intent": "질문의 핵심 의도 (한 문장)",
-                "actual_complexity": "simple/medium/complex",
-                "complexity_reason": "복잡도 판단 이유"
-            }},
-            "legal_concepts": [
-                {{
-                    "concept": "대규모내부거래/현황공시/비상장사 중요사항",
-                    "relevance": "primary/secondary",
-                    "specific_aspects": ["금액기준", "절차", "공시의무"]
-                }}
-            ],
-            "search_strategy": {{
-                "approach": "direct_lookup/focused_search/comprehensive_analysis",
-                "primary_manual": "주로 검색할 매뉴얼",
-                "search_keywords": ["핵심 검색어1", "핵심 검색어2"],
-                "expected_chunks_needed": 10,
-                "rationale": "이 전략을 선택한 이유"
-            }},
-            "answer_requirements": {{
-                "needs_specific_numbers": true,
-                "needs_process_steps": false,
-                "needs_timeline": false,
-                "needs_exceptions": false,
-                "needs_multiple_perspectives": false
-            }}
+            "query_type": "simple/standard/complex",
+            "main_topic": "대규모내부거래/현황공시/비상장사 중요사항/기타",
+            "required_info": ["필요한 정보 1", "필요한 정보 2"],
+            "search_keywords": ["검색 키워드 1", "검색 키워드 2"],
+            "expected_answer_type": "fact/process/analysis/comparison"
         }}
         """
         
         try:
             response = openai.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-4o-mini",  # 분석에는 저렴한 모델 사용
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
-                max_tokens=1000,
+                max_tokens=500,
                 response_format={"type": "json_object"}
             )
             
             analysis = json.loads(response.choices[0].message.content)
             
+            # 캐시 저장
             self.analysis_cache.put(cache_key, analysis)
-            
-            if len(self.analysis_cache.cache) % 10 == 0:
-                self.analysis_cache.clear_expired()
             
             return analysis
             
         except Exception as e:
-            logger.error(f"GPT-4o analysis error: {str(e)}")
-            return self._get_fallback_strategy(query)
-    
-    def _get_fallback_strategy(self, query: str) -> Dict:
-        """GPT 분석 실패 시 기본 전략"""
-        return {
-            "query_analysis": {
-                "core_intent": "질문 분석 실패 - 기본 검색 수행",
-                "actual_complexity": "medium",
-                "complexity_reason": "자동 분석 실패로 중간 복잡도 가정"
-            },
-            "legal_concepts": [],
-            "search_strategy": {
-                "approach": "focused_search",
-                "primary_manual": "대규모내부거래",
+            logger.error(f"Query analysis error: {str(e)}")
+            # 폴백 분석
+            return {
+                "query_type": "standard",
+                "main_topic": "기타",
+                "required_info": [],
                 "search_keywords": query.split()[:5],
-                "expected_chunks_needed": 30,
-                "rationale": "기본 검색 전략"
-            },
-            "answer_requirements": {
-                "needs_specific_numbers": True,
-                "needs_process_steps": True,
-                "needs_timeline": True,
-                "needs_exceptions": False,
-                "needs_multiple_perspectives": False
+                "expected_answer_type": "fact"
             }
-        }
-
-# ===== 질문 분류기 =====
-class QuestionClassifier:
-    """질문을 분석하여 어떤 매뉴얼을 우선 검색할지 결정"""
-    
-    def __init__(self):
-        self.categories = {
-            '대규모내부거래': {
-                'keywords': ['대규모내부거래', '내부거래', '이사회 의결', '이사회', '의결', 
-                           '계열사', '계열회사', '특수관계인', '자금', '대여', '차입', '보증',
-                           '자금거래', '유가증권', '자산거래', '50억', '거래금액'],
-                'patterns': [r'이사회.*의결', r'계열.*거래', r'내부.*거래'],
-                'manual_pattern': '대규모내부거래.*매뉴얼',
-                'priority': 1
-            },
-            '현황공시': {
-                'keywords': ['현황공시', '기업집단', '소속회사', '동일인', '친족', 
-                           '지분율', '임원', '순환출자', '상호출자', '지배구조',
-                           '계열편입', '계열제외', '주주현황', '임원현황'],
-                'patterns': [r'기업집단.*현황', r'소속.*회사', r'지분.*변동'],
-                'manual_pattern': '기업집단현황공시.*매뉴얼',
-                'priority': 2
-            },
-            '비상장사 중요사항': {
-                'keywords': ['비상장', '중요사항', '주식', '양도', '양수', '합병', 
-                           '분할', '영업양도', '임원변경', '증자', '감자',
-                           '정관변경', '해산', '청산'],
-                'patterns': [r'비상장.*공시', r'주식.*양도', r'중요.*사항'],
-                'manual_pattern': '비상장사.*중요사항.*매뉴얼',
-                'priority': 3
-            }
-        }
-    
-    def classify(self, question: str) -> Tuple[str, float]:
-        """질문을 분류하고 신뢰도를 반환"""
-        question_lower = question.lower()
-        scores = {}
-        
-        for category, info in self.categories.items():
-            score = 0
-            matched_keywords = []
-            
-            for i, keyword in enumerate(info['keywords']):
-                if keyword in question_lower:
-                    weight = 1.0 if i < 5 else 0.7
-                    score += weight
-                    matched_keywords.append(keyword)
-            
-            for pattern in info.get('patterns', []):
-                if re.search(pattern, question_lower):
-                    score += 1.5
-            
-            scores[category] = score
-        
-        if scores:
-            best_category = max(scores, key=scores.get)
-            max_possible_score = len(self.categories[best_category]['keywords']) + \
-                               len(self.categories[best_category].get('patterns', [])) * 1.5
-            confidence = min(scores[best_category] / max_possible_score, 1.0)
-            
-            if confidence < 0.15:
-                return None, 0.0
-                
-            return best_category, confidence
-        
-        return None, 0.0
-
-# ===== 복잡도 평가기 =====
-class ComplexityAssessor:
-    """질문의 복잡도를 평가하여 처리 방식을 결정"""
-    
-    def __init__(self):
-        self.simple_indicators = [
-            r'언제', r'며칠', r'기한', r'날짜', r'금액', r'%', r'얼마',
-            r'정의[가는]?', r'무엇', r'뜻[이은]?', r'의미[가는]?'
-        ]
-        
-        self.complex_indicators = [
-            r'동시에', r'여러', r'복합', r'연관', r'영향',
-            r'만[약일].*경우', r'[AB].*동시.*[CD]', r'거래.*여러',
-            r'전체적', r'종합적', r'분석', r'검토', r'평가',
-            r'리스크', r'위험', r'대응', r'전략'
-        ]
-        
-        self.medium_indicators = [
-            r'어떻게', r'방법', r'절차', r'과정',
-            r'주의', r'예외', r'특별', r'고려'
-        ]
-    
-    def assess(self, query: str) -> Tuple[QueryComplexity, float, Dict]:
-        """질문의 복잡도를 평가하고 관련 정보 반환"""
-        query_lower = query.lower()
-        
-        simple_score = sum(1 for pattern in self.simple_indicators 
-                         if re.search(pattern, query_lower))
-        complex_score = sum(2 for pattern in self.complex_indicators 
-                          if re.search(pattern, query_lower))
-        medium_score = sum(1.5 for pattern in self.medium_indicators 
-                         if re.search(pattern, query_lower))
-        
-        if len(query) > 150:
-            complex_score += 2
-        elif len(query) > 100:
-            complex_score += 1
-        elif len(query) < 30:
-            simple_score += 0.5
-            
-        if re.search(r'[AB]회사.*[CD]회사', query_lower):
-            complex_score += 2
-        if '?' in query and query.count('?') > 1:
-            complex_score += 1
-            
-        total_score = simple_score + medium_score + complex_score
-        
-        if total_score == 0:
-            complexity = QueryComplexity.MEDIUM
-            confidence = 0.5
-        elif complex_score > simple_score * 3:
-            complexity = QueryComplexity.COMPLEX
-            confidence = min(complex_score / (total_score + 1), 0.9)
-        elif simple_score > complex_score * 2:
-            complexity = QueryComplexity.SIMPLE
-            confidence = min(simple_score / (total_score + 1), 0.9)
-        else:
-            complexity = QueryComplexity.MEDIUM
-            confidence = 0.6
-            
-        analysis = {
-            'simple_score': simple_score,
-            'medium_score': medium_score,
-            'complex_score': complex_score,
-            'query_length': len(query),
-            'estimated_cost_multiplier': self._estimate_cost_multiplier(complexity)
-        }
-        
-        return complexity, confidence, analysis
-    
-    def _estimate_cost_multiplier(self, complexity: QueryComplexity) -> float:
-        """복잡도에 따른 예상 비용 배수"""
-        multipliers = {
-            QueryComplexity.SIMPLE: 1.0,
-            QueryComplexity.MEDIUM: 3.0,
-            QueryComplexity.COMPLEX: 10.0
-        }
-        return multipliers[complexity]
 
 # ===== 하이브리드 RAG 파이프라인 =====
-class HybridRAGPipeline:
-    """GPT-4o 기반 하이브리드 파이프라인"""
+class OptimizedHybridRAGPipeline:
+    """
+    비용 최적화가 적용된 하이브리드 RAG 파이프라인
+    
+    이 클래스는 전체 시스템의 핵심으로, 질문을 받아
+    적절한 모델을 선택하고, 검색을 수행하며, 답변을 생성합니다.
+    """
     
     def __init__(self, embedding_model, reranker_model, index, chunks):
         if not chunks:
-            raise ValueError("No chunks provided to HybridRAGPipeline")
+            raise ValueError("No chunks provided to pipeline")
         
         if index.ntotal == 0:
             raise ValueError("FAISS index is empty")
-        
-        # 임베딩 차원 검증
-        test_embedding = embedding_model.encode(["test"])
-        if len(test_embedding[0]) != index.d:
-            raise ValueError(f"Embedding dimension {len(test_embedding[0])} doesn't match index dimension {index.d}")
         
         self.embedding_model = embedding_model
         self.reranker_model = reranker_model
         self.index = index
         self.chunks = chunks
         
-        self.classifier = QuestionClassifier()
-        self.complexity_assessor = ComplexityAssessor()
-        self.gpt4o_analyzer = GPT4oQueryAnalyzer()
+        # 시스템 구성 요소들
+        self.model_selector = SimplifiedModelSelector()
+        self.query_analyzer = EnhancedQueryAnalyzer()
+        self.cache_strategy = SmartCacheStrategy()
+        self.budget_manager = BudgetManager()
         
-        self.version_manager = DocumentVersionManager()
-        self.conflict_resolver = ConflictResolver(self.version_manager)
-        
+        # 매뉴얼별 인덱스 구축
         self.manual_indices = self._build_manual_indices()
         
-        self.chunks_info = {
-            category: len(indices) 
-            for category, indices in self.manual_indices.items()
-        }
+        # 성능 추적
+        self.performance_history = []
         
-        self.search_cache = LRUCache(max_size=50, ttl=1800)
-        self.embedding_cache = LRUCache(max_size=100, ttl=3600)
-        
-        self._extract_chunk_dates()
-        
-        logger.info(f"HybridRAGPipeline initialized with {len(chunks)} chunks")
-    
-    def _extract_chunk_dates(self):
-        """모든 청크의 날짜 정보를 미리 추출"""
-        for chunk in self.chunks:
-            doc_date = self.version_manager.extract_document_date(chunk)
-            if doc_date:
-                metadata = json.loads(chunk.get('metadata', '{}'))
-                metadata['document_date'] = doc_date
-                chunk['metadata'] = json.dumps(metadata)
+        logger.info(f"Pipeline initialized with {len(chunks)} chunks")
     
     def _build_manual_indices(self) -> Dict[str, List[int]]:
         """각 매뉴얼별로 청크 인덱스를 미리 구축"""
@@ -766,118 +715,87 @@ class HybridRAGPipeline:
         
         return dict(indices)
     
-    def _get_query_embedding(self, query: str) -> np.ndarray:
-        """쿼리 임베딩을 캐시와 함께 가져오기"""
-        cached_embedding = self.embedding_cache.get(query)
-        if cached_embedding is not None:
-            return cached_embedding
-            
-        embedding = self.embedding_model.encode([query])
-        embedding = np.array(embedding, dtype=np.float32)
-        
-        self.embedding_cache.put(query, embedding)
-        
-        return embedding
-    
     async def process_query(self, query: str, top_k: int = 5) -> Tuple[List[SearchResult], Dict]:
-        """GPT-4o가 질문을 분석하여 최적의 처리 방식을 선택"""
+        """
+        질문을 처리하는 메인 메서드
+        
+        처리 과정:
+        1. 캐시 확인
+        2. 질문 분석
+        3. 모델 선택
+        4. 검색 수행
+        5. 답변 생성
+        """
         start_time = time.time()
         
-        analysis_start = time.time()
-        try:
-            gpt_analysis = self.gpt4o_analyzer.analyze_and_strategize(
-                query, self.chunks_info
-            )
-            analysis_time = time.time() - analysis_start
-        except Exception as e:
-            logger.error(f"GPT-4o analysis failed: {str(e)}, falling back to rule-based")
-            return self._fallback_process_query(query, top_k)
-        
-        actual_complexity = gpt_analysis['query_analysis']['actual_complexity']
-        search_approach = gpt_analysis['search_strategy']['approach']
-        
-        stats = {
-            'gpt_analysis': gpt_analysis,
-            'analysis_time': analysis_time,
-            'actual_complexity': actual_complexity,
-            'search_approach': search_approach
-        }
-        
-        if search_approach == 'direct_lookup':
-            results, search_stats = await self._gpt_guided_direct_search(
-                query, gpt_analysis, top_k
-            )
-            stats['processing_mode'] = 'gpt_guided_direct'
-            
-        elif search_approach == 'focused_search':
-            results, search_stats = await self._gpt_guided_focused_search(
-                query, gpt_analysis, top_k
-            )
-            stats['processing_mode'] = 'gpt_guided_focused'
-            
-        else:  # comprehensive_analysis
-            results, search_stats = await self._gpt_guided_comprehensive_search(
-                query, gpt_analysis, top_k
-            )
-            stats['processing_mode'] = 'gpt_guided_comprehensive'
-        
-        results = self.conflict_resolver.resolve_conflicts(results, query)
-        
-        outdated_warnings = []
-        for result in results:
-            if result.metadata.get('has_outdated_info'):
-                outdated_warnings.extend(result.metadata.get('warnings', []))
-        
-        stats.update(search_stats)
-        stats['total_time'] = time.time() - start_time
-        stats['outdated_warnings'] = outdated_warnings
-        stats['has_version_conflicts'] = len(outdated_warnings) > 0
-        
-        return results, stats
-    
-    async def _gpt_guided_direct_search(self, query: str, gpt_analysis: Dict, 
-                                       top_k: int) -> Tuple[List[SearchResult], Dict]:
-        """GPT 분석을 기반으로 한 직접 검색"""
-        start_time = time.time()
-        
-        primary_manual = gpt_analysis['search_strategy']['primary_manual']
-        search_keywords = gpt_analysis['search_strategy']['search_keywords']
-        
-        target_indices = self.manual_indices.get(primary_manual, [])[:100]
-        
-        if not target_indices:
-            logger.warning(f"No indices for manual '{primary_manual}', using all chunks")
-            target_indices = list(range(min(len(self.chunks), 50)))
-            if not target_indices:
-                return [], {
-                    'search_time': time.time() - start_time,
-                    'searched_chunks': 0,
-                    'search_method': 'direct_vector',
-                    'warning': 'No chunks available'
-                }
-        
-        enhanced_query = f"{query} {' '.join(search_keywords)}"
-        query_vector = self._get_query_embedding(enhanced_query)
-        
-        k_search = min(len(target_indices), max(1, top_k * 3))
-        
-        try:
-            scores, indices = self.index.search(query_vector, k_search)
-        except Exception as e:
-            logger.error(f"FAISS search error in direct search: {str(e)}")
-            return [], {
-                'search_time': time.time() - start_time,
-                'searched_chunks': len(target_indices),
-                'search_method': 'direct_vector',
-                'error': str(e)
+        # 1. 캐시 확인
+        cached_result = self.cache_strategy.get_cached_result(query)
+        if cached_result:
+            logger.info(f"Cache hit for query: {query[:50]}...")
+            return cached_result['results'], {
+                'cache_hit': True,
+                'total_time': 0.1,
+                'model_used': cached_result['model']
             }
         
+        # 2. 질문 분석
+        analysis = await self.query_analyzer.analyze_query(query)
+        
+        # 3. 모델 선택
+        selected_model, selection_info = self.model_selector.select_model(query, analysis)
+        
+        # 4. 검색 수행
+        search_results = await self._perform_search(query, analysis, top_k)
+        
+        # 5. 통계 정보 구성
+        stats = {
+            'query_analysis': analysis,
+            'selected_model': selected_model,
+            'selection_info': selection_info,
+            'search_time': time.time() - start_time,
+            'cache_hit': False,
+            'total_results': len(search_results)
+        }
+        
+        # 6. 캐시 저장 (간단한 질문만)
+        if analysis['query_type'] == 'simple':
+            self.cache_strategy.store_result(query, {
+                'results': search_results,
+                'stats': stats
+            }, selected_model)
+        
+        return search_results, stats
+    
+    async def _perform_search(self, query: str, analysis: Dict, top_k: int) -> List[SearchResult]:
+        """실제 검색 수행"""
+        # 관련 매뉴얼 확인
+        main_topic = analysis.get('main_topic', '기타')
+        relevant_indices = self.manual_indices.get(main_topic, [])
+        
+        if not relevant_indices:
+            relevant_indices = list(range(min(len(self.chunks), 300)))
+        
+        # 검색어 확장
+        search_keywords = analysis.get('search_keywords', [])
+        enhanced_query = f"{query} {' '.join(search_keywords)}"
+        
+        # 임베딩 생성
+        query_embedding = self.embedding_model.encode([enhanced_query])
+        query_vector = np.array(query_embedding, dtype=np.float32)
+        
+        # FAISS 검색
+        k_search = min(len(relevant_indices), max(1, top_k * 3))
+        scores, indices = self.index.search(query_vector, k_search)
+        
+        # 결과 구성
         results = []
-        target_set = set(target_indices)
+        seen_chunks = set()
         
         for idx, score in zip(indices[0], scores[0]):
-            if idx in target_set and idx < len(self.chunks):
+            if idx in relevant_indices and idx not in seen_chunks:
+                seen_chunks.add(idx)
                 chunk = self.chunks[idx]
+                
                 results.append(SearchResult(
                     chunk_id=chunk.get('chunk_id', str(idx)),
                     content=chunk['content'],
@@ -887,391 +805,32 @@ class HybridRAGPipeline:
                     chunk_type=chunk.get('chunk_type', 'unknown'),
                     metadata=json.loads(chunk.get('metadata', '{}'))
                 ))
+                
                 if len(results) >= top_k:
                     break
         
-        stats = {
-            'search_time': time.time() - start_time,
-            'searched_chunks': len(target_indices),
-            'search_method': 'direct_vector'
-        }
-        
-        return results, stats
-    
-    async def _gpt_guided_focused_search(self, query: str, gpt_analysis: Dict, 
-                                        top_k: int) -> Tuple[List[SearchResult], Dict]:
-        """GPT 분석을 기반으로 한 집중 검색 (완전히 수정된 버전)"""
-        start_time = time.time()
-        stats = {
-            'search_time': 0,
-            'searched_chunks': 0,
-            'search_method': 'focused_vector',
-            'errors': []
-        }
-        
-        try:
-            if not query or not isinstance(query, str):
-                raise ValueError(f"Invalid query: {query}")
-            if not isinstance(top_k, int) or top_k <= 0:
-                raise ValueError(f"Invalid top_k value: {top_k}")
-                
-            if not gpt_analysis or 'search_strategy' not in gpt_analysis:
-                logger.warning("Invalid or missing GPT analysis, using defaults")
-                gpt_analysis = self._get_default_analysis(query)
-                
-            primary_manual = gpt_analysis['search_strategy'].get('primary_manual', '')
-            search_keywords = gpt_analysis['search_strategy'].get('search_keywords', [])
-            expected_chunks = gpt_analysis['search_strategy'].get('expected_chunks_needed', 10)
-            
-            logger.info(f"Search strategy - Manual: {primary_manual}, Keywords: {search_keywords}")
-            
-            search_limit = min(expected_chunks * 2, 200)
-            target_indices = self.manual_indices.get(primary_manual, [])[:search_limit]
-            
-            if not target_indices:
-                logger.warning(f"No target indices found for manual '{primary_manual}'")
-                stats['errors'].append({
-                    'type': 'missing_indices',
-                    'manual': primary_manual,
-                    'action': 'fallback_to_all_chunks'
-                })
-                
-                target_indices = list(range(min(len(self.chunks), 100)))
-                if not target_indices:
-                    logger.error("No chunks available for search")
-                    return [], stats
-            
-            requirements = gpt_analysis.get('answer_requirements', {})
-            if requirements.get('needs_specific_numbers'):
-                try:
-                    filtered_indices = [
-                        idx for idx in target_indices 
-                        if idx < len(self.chunks) and
-                        re.search(r'\d+억|\d+%', self.chunks[idx].get('content', ''))
-                    ]
-                    if filtered_indices:
-                        target_indices = filtered_indices
-                        logger.debug(f"Filtered to {len(filtered_indices)} chunks with numbers")
-                except Exception as e:
-                    logger.warning(f"Error during number filtering: {str(e)}")
-                    stats['errors'].append({
-                        'type': 'filter_error',
-                        'error': str(e)
-                    })
-            
-            try:
-                enhanced_query = f"{query} {' '.join(search_keywords)}"
-                
-                with error_context("Creating query embedding"):
-                    query_vector = self._get_query_embedding(enhanced_query)
-                    
-                k_search = min(len(target_indices), max(1, top_k * 5))
-                logger.debug(f"Performing FAISS search with k={k_search}")
-                
-                scores, indices = self.index.search(query_vector, k_search)
-                
-            except Exception as e:
-                logger.error(f"FAISS search error: {str(e)}")
-                stats['errors'].append({
-                    'type': 'faiss_error',
-                    'error': str(e),
-                    'k_search': k_search,
-                    'target_indices_count': len(target_indices)
-                })
-                return [], stats
-            
-            results = []
-            target_set = set(target_indices)
-            invalid_results_count = 0
-            
-            for idx, score in zip(indices[0], scores[0]):
-                try:
-                    if idx < 0 or idx >= len(self.chunks):
-                        invalid_results_count += 1
-                        continue
-                        
-                    if idx not in target_set:
-                        continue
-                        
-                    chunk = self.chunks[idx]
-                    
-                    if not chunk or 'content' not in chunk:
-                        logger.warning(f"Invalid chunk at index {idx}")
-                        invalid_results_count += 1
-                        continue
-                    
-                    relevance_boost = self._calculate_gpt_relevance(
-                        chunk['content'], gpt_analysis
-                    )
-                    
-                    result = SearchResult(
-                        chunk_id=chunk.get('chunk_id', str(idx)),
-                        content=chunk.get('content', ''),
-                        score=float(score) * (1 + relevance_boost),
-                        source=chunk.get('source', 'Unknown'),
-                        page=chunk.get('page', 0),
-                        chunk_type=chunk.get('chunk_type', 'unknown'),
-                        metadata=json.loads(chunk.get('metadata', '{}'))
-                    )
-                    
-                    results.append(result)
-                    
-                    if len(results) >= top_k * 2:
-                        break
-                        
-                except Exception as e:
-                    logger.error(f"Error processing result at index {idx}: {str(e)}")
-                    invalid_results_count += 1
-                    continue
-            
-            if invalid_results_count > 0:
-                logger.warning(f"Found {invalid_results_count} invalid results during processing")
-                stats['errors'].append({
-                    'type': 'invalid_results',
-                    'count': invalid_results_count
-                })
-            
-            results.sort(key=lambda x: x.score, reverse=True)
-            results = results[:top_k]
-            
-            stats.update({
-                'search_time': time.time() - start_time,
-                'searched_chunks': len(target_indices),
-                'results_count': len(results),
-                'has_errors': len(stats['errors']) > 0
-            })
-            
-            logger.info(f"Search completed in {stats['search_time']:.2f}s, found {len(results)} results")
-            
-            return results, stats
-            
-        except Exception as e:
-            logger.error(f"Unexpected error in focused search: {str(e)}")
-            logger.debug(f"Full traceback:\n{traceback.format_exc()}")
-            
-            stats['errors'].append({
-                'type': 'unexpected_error',
-                'error': str(e),
-                'traceback': traceback.format_exc()
-            })
-            stats['search_time'] = time.time() - start_time
-            
-            return [], stats
-    
-    async def _gpt_guided_comprehensive_search(self, query: str, gpt_analysis: Dict, 
-                                              top_k: int) -> Tuple[List[SearchResult], Dict]:
-        """GPT 분석을 기반으로 한 종합 검색"""
-        start_time = time.time()
-        
-        all_results = []
-        
-        for concept in gpt_analysis['legal_concepts']:
-            if concept['relevance'] in ['primary', 'secondary']:
-                manual = concept['concept']
-                if manual in self.manual_indices:
-                    partial_results = await self._search_in_manual(
-                        query, manual, concept['specific_aspects'], top_k // 2
-                    )
-                    all_results.extend(partial_results)
-        
-        seen_chunks = set()
-        unique_results = []
-        for result in sorted(all_results, key=lambda x: x.score, reverse=True):
-            if result.chunk_id not in seen_chunks:
-                seen_chunks.add(result.chunk_id)
-                unique_results.append(result)
-                if len(unique_results) >= top_k:
-                    break
-        
-        stats = {
-            'search_time': time.time() - start_time,
-            'searched_chunks': sum(len(self.manual_indices.get(c['concept'], [])) 
-                                 for c in gpt_analysis['legal_concepts'] 
-                                 if c['relevance'] in ['primary', 'secondary']),
-            'search_method': 'comprehensive_multi_manual'
-        }
-        
-        return unique_results, stats
-    
-    def _calculate_gpt_relevance(self, content: str, gpt_analysis: Dict) -> float:
-        """GPT 분석 결과와 청크 내용의 관련성 계산"""
-        relevance_boost = 0.0
-        content_lower = content.lower()
-        
-        for keyword in gpt_analysis['search_strategy']['search_keywords']:
-            if keyword.lower() in content_lower:
-                relevance_boost += 0.1
-        
-        requirements = gpt_analysis['answer_requirements']
-        if requirements.get('needs_specific_numbers') and re.search(r'\d+억|\d+%', content):
-            relevance_boost += 0.2
-        if requirements.get('needs_timeline') and re.search(r'\d+일|기한', content):
-            relevance_boost += 0.2
-        if requirements.get('needs_process_steps') and re.search(r'절차|단계|순서', content):
-            relevance_boost += 0.15
-        
-        return min(relevance_boost, 0.5)
-    
-    async def _search_in_manual(self, query: str, manual: str, aspects: List[str], 
-                               limit: int) -> List[SearchResult]:
-        """특정 매뉴얼 내에서 검색"""
-        indices = self.manual_indices.get(manual, [])[:100]
-        
-        if not indices:
-            logger.warning(f"No indices found for manual '{manual}'")
-            return []
-        
-        enhanced_query = f"{query} {' '.join(aspects)}"
-        query_vector = self._get_query_embedding(enhanced_query)
-        
-        k_search = min(len(indices), max(1, limit * 3))
-        
-        try:
-            scores, search_indices = self.index.search(query_vector, k_search)
-        except Exception as e:
-            logger.error(f"FAISS search error in manual search: {str(e)}")
-            return []
-        
-        results = []
-        indices_set = set(indices)
-        
-        for idx, score in zip(search_indices[0], scores[0]):
-            if idx in indices_set and idx < len(self.chunks):
-                chunk = self.chunks[idx]
-                results.append(SearchResult(
-                    chunk_id=chunk.get('chunk_id', str(idx)),
-                    content=chunk['content'],
-                    score=float(score),
-                    source=chunk['source'],
-                    page=chunk['page'],
-                    chunk_type=chunk.get('chunk_type', 'unknown'),
-                    metadata=json.loads(chunk.get('metadata', '{}'))
-                ))
-                if len(results) >= limit:
-                    break
+        # 리랭킹 (옵션)
+        if self.reranker_model and len(results) > 0:
+            # 리랭킹 로직 (필요시 구현)
+            pass
         
         return results
-    
-    def _fallback_process_query(self, query: str, top_k: int) -> Tuple[List[SearchResult], Dict]:
-        """GPT 분석 실패 시 기존 방식으로 폴백"""
-        results, stats = self._fast_traditional_search(query, top_k)
-        stats['processing_mode'] = 'fallback_traditional'
-        stats['gpt_failure'] = True
-        return results, stats
-    
-    def _fast_traditional_search(self, query: str, top_k: int) -> Tuple[List[SearchResult], Dict]:
-        """기존의 빠른 벡터 검색 방식"""
-        start_time = time.time()
-        
-        cache_key = hashlib.md5(f"{query}_{top_k}_traditional".encode()).hexdigest()
-        cached = self.search_cache.get(cache_key)
-        if cached:
-            stats = cached['stats'].copy()
-            stats['cache_hit'] = True
-            return cached['results'], stats
-        
-        category, cat_confidence = self.classifier.classify(query)
-        
-        if category and cat_confidence > 0.3:
-            primary_indices = self.manual_indices.get(category, [])
-            if len(primary_indices) > 200:
-                primary_indices = primary_indices[:200]
-            secondary_indices = []
-        else:
-            primary_indices = list(range(min(len(self.chunks), 300)))
-            secondary_indices = []
-        
-        query_vector = self._get_query_embedding(query)
-        
-        k_search = min(len(primary_indices), max(1, top_k * 5))
-        scores, indices = self.index.search(query_vector, k_search)
-        
-        results = []
-        seen_chunks = set()
-        
-        if primary_indices:
-            primary_set = set(primary_indices)
-            for idx, score in zip(indices[0], scores[0]):
-                if idx in primary_set and idx not in seen_chunks and idx < len(self.chunks):
-                    seen_chunks.add(idx)
-                    chunk = self.chunks[idx]
-                    result = SearchResult(
-                        chunk_id=chunk.get('chunk_id', str(idx)),
-                        content=chunk['content'],
-                        score=float(score),
-                        source=chunk['source'],
-                        page=chunk['page'],
-                        chunk_type=chunk.get('chunk_type', 'unknown'),
-                        metadata=json.loads(chunk.get('metadata', '{}'))
-                    )
-                    results.append(result)
-                    if len(results) >= top_k:
-                        break
-        
-        stats = {
-            'search_time': time.time() - start_time,
-            'category': category,
-            'category_confidence': cat_confidence,
-            'cache_hit': False,
-            'searched_chunks': len(primary_indices)
-        }
-        
-        if stats['search_time'] < 0.5 and len(self.search_cache.cache) < self.search_cache.max_size:
-            self.search_cache.put(cache_key, {
-                'results': results,
-                'stats': stats,
-                'timestamp': time.time()
-            })
-        
-        return results, stats
-    
-    def _get_default_analysis(self, query: str) -> Dict:
-        """GPT 분석 실패 시 사용할 기본 분석 생성"""
-        return {
-            'query_analysis': {
-                'core_intent': query,
-                'actual_complexity': 'medium',
-                'complexity_reason': 'Default analysis due to GPT failure'
-            },
-            'search_strategy': {
-                'primary_manual': '대규모내부거래',
-                'search_keywords': query.split()[:5],
-                'expected_chunks_needed': 20,
-                'approach': 'focused_search'
-            },
-            'answer_requirements': {
-                'needs_specific_numbers': True,
-                'needs_process_steps': True
-            }
-        }
 
 # ===== 답변 생성 함수 =====
-def determine_temperature(query: str, complexity: str) -> float:
-    """질문 유형과 복잡도에 따라 최적의 temperature 결정"""
-    query_lower = query.lower()
+async def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> Tuple[str, Dict]:
+    """
+    선택된 모델을 사용하여 답변 생성
     
-    base_temps = {
-        'simple': 0.1,
-        'medium': 0.3,
-        'complex': 0.5
-    }
+    이 함수는 검색 결과를 바탕으로 사용자 질문에 대한
+    완성된 답변을 생성합니다.
+    """
     
-    temp = base_temps.get(complexity, 0.3)
-    
-    if any(keyword in query_lower for keyword in ['언제', '며칠', '기한', '날짜', '금액', '%']):
-        temp = min(temp, 0.1)
-    elif any(keyword in query_lower for keyword in ['전략', '대응', '리스크', '주의', '권장']):
-        temp = max(temp, 0.7)
-    
-    return temp
-
-def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str:
-    """AI를 활용한 고품질 답변 생성"""
+    # 선택된 모델 확인
+    model = stats.get('selected_model', 'gpt-4o-mini')
     
     # 컨텍스트 구성
     context_parts = []
-    
-    for i, result in enumerate(results[:5]):
+    for i, result in enumerate(results[:5]):  # 상위 5개 결과만 사용
         context_parts.append(f"""
 [참고 {i+1}] {result.source} (페이지 {result.page})
 {result.content}
@@ -1279,48 +838,31 @@ def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str
     
     context = "\n---\n".join(context_parts)
     
-    # 복잡도 정보 활용
-    gpt_analysis = stats.get('gpt_analysis', {})
-    complexity = gpt_analysis.get('query_analysis', {}).get('actual_complexity', 'medium')
-    temperature = determine_temperature(query, complexity)
+    # 질문 유형에 따른 프롬프트 조정
+    query_type = stats.get('query_analysis', {}).get('query_type', 'standard')
     
-    # 처리 모드별 특별 지시
-    mode_instructions = {
-        'gpt_guided_direct': "직접 검색 결과를 바탕으로 간결하고 정확한 답변을 제공하세요.",
-        'gpt_guided_focused': "핵심 주제에 대해 상세하고 실무적인 답변을 제공하세요.",
-        'gpt_guided_comprehensive': "여러 관련 주제를 종합하여 포괄적인 답변을 제공하세요.",
-        'fallback_traditional': "제공된 참고 자료를 바탕으로 간결하고 정확한 답변을 제공하세요."
-    }
-    
-    mode = stats.get('processing_mode', 'fallback_traditional')
-    extra_instruction = mode_instructions.get(mode, "")
-    
-    # 카테고리별 특화 지시사항
-    category = stats.get('category')
-    if not category and gpt_analysis:
-        primary_manual = gpt_analysis.get('search_strategy', {}).get('primary_manual')
-        category = primary_manual
-    
-    if category:
-        category_instructions = {
-            '대규모내부거래': "이사회 의결 요건, 공시 기한, 면제 조건을 명확히 설명하세요.",
-            '현황공시': "공시 주체, 시기, 제출 서류를 구체적으로 안내하세요.",
-            '비상장사 중요사항': "공시 대상 거래, 기한, 제출 방법을 상세히 설명하세요."
-        }
-        extra_instruction += f"\n{category_instructions.get(category, '')}"
+    if query_type == 'simple':
+        instruction = "간결하고 명확하게 답변해주세요."
+        max_tokens = 500
+    elif query_type == 'complex':
+        instruction = "단계별로 상세하게 설명해주세요."
+        max_tokens = 1500
+    else:
+        instruction = "정확하고 실무적인 답변을 제공해주세요."
+        max_tokens = 1000
     
     # 시스템 프롬프트
     system_prompt = f"""당신은 한국 공정거래위원회 전문가입니다.
-제공된 자료를 근거로 정확하고 실무적인 답변을 제공하세요.
+제공된 자료를 근거로 정확한 답변을 제공하세요.
 
-답변은 다음 구조를 따라주세요:
+{instruction}
+
+답변 구조:
 1. 핵심 답변 (1-2문장)
-2. 상세 설명 (근거 조항 포함)
-3. 주의사항 또는 예외사항 (있는 경우)
-
-{extra_instruction}"""
+2. 상세 설명 (필요시)
+3. 주의사항 (있는 경우)"""
     
-    # AI 호출
+    # 메시지 구성
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"""다음 자료를 바탕으로 질문에 답변해주세요.
@@ -1329,19 +871,102 @@ def generate_answer(query: str, results: List[SearchResult], stats: Dict) -> str
 {context}
 
 [질문]
-{query}
-
-{"간결하고 명확하게" if complexity == 'simple' else "상세하고 실무적으로"} 답변해주세요."""}
+{query}"""}
     ]
     
-    response = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=messages,
-        temperature=temperature,
-        max_tokens=1500
+    # API 호출 시작 시간
+    api_start = time.time()
+    
+    try:
+        # 모델에 따른 temperature 설정
+        temperature = 0.1 if query_type == 'simple' else 0.3
+        
+        response = openai.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        
+        answer = response.choices[0].message.content
+        
+        # 토큰 사용량 추정 (실제로는 response에서 가져와야 함)
+        estimated_tokens = len(context) / 4 + len(answer) / 4
+        
+        # 비용 계산
+        cost = stats['selection_info']['estimated_cost']
+        
+        # 예산에 추가
+        if 'budget_manager' in globals():
+            budget_manager = BudgetManager()
+            budget_manager.add_usage(cost)
+        
+        generation_stats = {
+            'generation_time': time.time() - api_start,
+            'model': model,
+            'estimated_tokens': estimated_tokens,
+            'cost': cost
+        }
+        
+        return answer, generation_stats
+        
+    except Exception as e:
+        logger.error(f"Answer generation error: {str(e)}")
+        return "죄송합니다. 답변 생성 중 오류가 발생했습니다.", {
+            'generation_time': time.time() - api_start,
+            'error': str(e)
+        }
+
+# ===== 성능 시각화 함수들 =====
+def create_complexity_gauge(score: float) -> go.Figure:
+    """복잡도를 게이지 차트로 표시"""
+    fig = go.Figure(go.Indicator(
+        mode = "gauge+number",
+        value = score,
+        domain = {'x': [0, 1], 'y': [0, 1]},
+        title = {'text': "질문 복잡도"},
+        gauge = {
+            'axis': {'range': [None, 1]},
+            'bar': {'color': "darkblue"},
+            'steps': [
+                {'range': [0, 0.3], 'color': "lightgreen"},
+                {'range': [0.3, 0.7], 'color': "yellow"},
+                {'range': [0.7, 1], 'color': "lightcoral"}
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': 0.85
+            }
+        }
+    ))
+    
+    fig.update_layout(height=200, margin=dict(l=20, r=20, t=40, b=20))
+    return fig
+
+def create_budget_pie_chart(used: float, remaining: float) -> go.Figure:
+    """예산 사용 현황을 파이 차트로 표시"""
+    fig = go.Figure(data=[go.Pie(
+        labels=['사용됨', '남음'],
+        values=[used, remaining],
+        hole=.3,
+        marker_colors=['#ff6b6b', '#51cf66']
+    )])
+    
+    fig.update_traces(
+        textposition='inside',
+        textinfo='percent+label',
+        hoverinfo='label+value+percent'
     )
     
-    return response.choices[0].message.content
+    fig.update_layout(
+        title="일일 예산 현황",
+        height=300,
+        margin=dict(l=20, r=20, t=40, b=20),
+        showlegend=False
+    )
+    
+    return fig
 
 # ===== 모델 및 데이터 로딩 =====
 @st.cache_resource(show_spinner=False)
@@ -1357,29 +982,39 @@ def load_models_and_data():
             return None, None, None, None
         
         with st.spinner("🤖 AI 시스템을 준비하는 중... (최초 1회만 수행됩니다)"):
+            # FAISS 인덱스 로드
             index = faiss.read_index("manuals_vector_db.index")
+            
+            # 청크 데이터 로드
             with open("all_manual_chunks.json", "r", encoding="utf-8") as f:
                 chunks = json.load(f)
             
+            # 임베딩 모델 로드
             try:
                 embedding_model = SentenceTransformer('jhgan/ko-sroberta-multitask')
             except Exception as e:
                 st.warning("한국어 모델 로드 실패. 대체 모델을 사용합니다.")
                 embedding_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
             
+            # 리랭커 모델 로드 (선택적)
             try:
                 reranker_model = CrossEncoder('Dongjin-kr/ko-reranker')
             except:
                 reranker_model = None
+                logger.warning("Reranker model not loaded")
         
         return embedding_model, reranker_model, index, chunks
         
     except Exception as e:
         st.error(f"시스템 초기화 실패: {str(e)}")
+        logger.error(f"Initialization error: {str(e)}")
         return None, None, None, None
 
 # ===== 메인 UI =====
 def main():
+    """메인 애플리케이션 함수"""
+    
+    # 헤더 표시
     st.markdown("""
     <div class="main-header">
         <h1>⚖️ 전략기획부 AI 법률 보조원</h1>
@@ -1387,20 +1022,30 @@ def main():
     </div>
     """, unsafe_allow_html=True)
     
+    # 모델 및 데이터 로드
     models = load_models_and_data()
     if not all(models):
         st.stop()
     
     embedding_model, reranker_model, index, chunks = models
     
-    rag = HybridRAGPipeline(embedding_model, reranker_model, index, chunks)
+    # RAG 파이프라인 초기화
+    if 'rag_pipeline' not in st.session_state:
+        st.session_state.rag_pipeline = OptimizedHybridRAGPipeline(
+            embedding_model, reranker_model, index, chunks
+        )
     
+    rag = st.session_state.rag_pipeline
+    
+    # 대화 기록 초기화
     if "messages" not in st.session_state:
         st.session_state.messages = []
     
+    # 채팅 컨테이너
     chat_container = st.container()
     
     with chat_container:
+        # 이전 대화 표시
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 if message["role"] == "user":
@@ -1409,140 +1054,199 @@ def main():
                     if isinstance(message["content"], dict):
                         st.write(message["content"]["answer"])
                         
-                        complexity = message["content"].get("complexity", "unknown")
-                        complexity_html = f'<span class="complexity-indicator complexity-{complexity}">{complexity.upper()}</span>'
-                        st.markdown(f"처리 복잡도: {complexity_html}", unsafe_allow_html=True)
+                        # 메타 정보 표시
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            model_used = message["content"].get("model_used", "unknown")
+                            model_emoji = {
+                                'gpt-4o-mini': '🟢',
+                                'o4-mini': '🟡',
+                                'gpt-4o': '🔵'
+                            }.get(model_used, '⚪')
+                            st.caption(f"{model_emoji} {model_used}")
                         
-                        if "total_time" in message["content"]:
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric("🔍 검색", f"{message['content']['search_time']:.1f}초")
-                            with col2:
-                                st.metric("✍️ 답변 생성", f"{message['content']['generation_time']:.1f}초")
-                            with col3:
-                                st.metric("⏱️ 전체", f"{message['content']['total_time']:.1f}초")
+                        with col2:
+                            cost = message["content"].get("cost", 0)
+                            if cost < 0.01:
+                                cost_class = "cost-saved"
+                            elif cost < 0.05:
+                                cost_class = "cost-normal"
+                            else:
+                                cost_class = "cost-high"
+                            st.caption(f'<span class="cost-efficiency {cost_class}">${cost:.4f}</span>', 
+                                     unsafe_allow_html=True)
+                        
+                        with col3:
+                            total_time = message["content"].get("total_time", 0)
+                            st.caption(f"⏱️ {total_time:.1f}초")
                     else:
                         st.write(message["content"])
         
+        # 사용자 입력
         if prompt := st.chat_input("질문을 입력하세요 (예: 대규모내부거래 공시 기한은?)"):
+            # 사용자 메시지 추가
             st.session_state.messages.append({"role": "user", "content": prompt})
+            
             with st.chat_message("user"):
                 st.write(prompt)
             
+            # AI 응답
             with st.chat_message("assistant"):
                 total_start_time = time.time()
                 
-                search_start_time = time.time()
-                with st.spinner("🔍 질문을 분석하고 최적의 검색 전략을 수립하는 중..."):
-                    results, stats = run_async_in_streamlit(rag.process_query(prompt, top_k=5))
-                search_time = time.time() - search_start_time
+                # 검색 수행
+                with st.spinner("🔍 최적의 AI 모델을 선택하고 검색을 수행하는 중..."):
+                    results, search_stats = run_async_in_streamlit(
+                        rag.process_query(prompt, top_k=5)
+                    )
                 
-                generation_start_time = time.time()
+                # 답변 생성
                 with st.spinner("💭 답변을 생성하는 중..."):
-                    answer = generate_answer(prompt, results, stats)
-                generation_time = time.time() - generation_start_time
+                    answer, generation_stats = run_async_in_streamlit(
+                        generate_answer(prompt, results, search_stats)
+                    )
                 
-                total_time = time.time() - total_start_time
-                
+                # 답변 표시
                 st.write(answer)
                 
-                gpt_analysis = stats.get('gpt_analysis', {})
-                complexity = gpt_analysis.get('query_analysis', {}).get('actual_complexity', 'unknown')
-                mode = stats.get('processing_mode', 'unknown')
-                complexity_html = f'<span class="complexity-indicator complexity-{complexity}">{complexity.upper()}</span>'
-                st.markdown(f"질문 복잡도: {complexity_html} | 처리 방식: **{mode}**", unsafe_allow_html=True)
+                # 통계 정보
+                total_time = time.time() - total_start_time
                 
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.metric("🔍 검색", f"{search_time:.1f}초")
-                with col2:
-                    st.metric("✍️ 답변 생성", f"{generation_time:.1f}초")
-                with col3:
-                    st.metric("⏱️ 전체", f"{total_time:.1f}초")
+                    model_used = search_stats.get('selected_model', 'unknown')
+                    model_emoji = {
+                        'gpt-4o-mini': '🟢',
+                        'o4-mini': '🟡',
+                        'gpt-4o': '🔵'
+                    }.get(model_used, '⚪')
+                    st.caption(f"{model_emoji} {model_used}")
                 
+                with col2:
+                    cost = generation_stats.get('cost', 0)
+                    if cost < 0.01:
+                        cost_class = "cost-saved"
+                    elif cost < 0.05:
+                        cost_class = "cost-normal"
+                    else:
+                        cost_class = "cost-high"
+                    st.caption(f'<span class="cost-efficiency {cost_class}">${cost:.4f}</span>', 
+                             unsafe_allow_html=True)
+                
+                with col3:
+                    st.caption(f"⏱️ {total_time:.1f}초")
+                
+                # 상세 정보 (접을 수 있음)
                 with st.expander("🔍 상세 정보 보기"):
-                    if gpt_analysis:
-                        st.subheader("🤖 AI 질문 분석")
-                        st.json({
-                            "핵심 의도": gpt_analysis.get('query_analysis', {}).get('core_intent', ''),
-                            "실제 복잡도": gpt_analysis.get('query_analysis', {}).get('actual_complexity', ''),
-                            "검색 전략": gpt_analysis.get('search_strategy', {}).get('approach', ''),
-                            "주요 매뉴얼": gpt_analysis.get('search_strategy', {}).get('primary_manual', '')
-                        })
+                    st.subheader("📊 처리 과정")
                     
-                    mode_descriptions = {
-                        'gpt_guided_direct': "AI가 단순한 질문으로 판단하여 직접 검색을 수행했습니다.",
-                        'gpt_guided_focused': "AI가 특정 주제에 대한 집중 검색을 수행했습니다.",
-                        'gpt_guided_comprehensive': "AI가 여러 주제에 걸친 종합 분석을 수행했습니다.",
-                        'fallback_traditional': "기본 검색 방식으로 처리했습니다."
-                    }
-                    st.info(f"🎯 **처리 방식**: {mode_descriptions.get(mode, '알 수 없음')}")
+                    # 복잡도 게이지
+                    complexity_score = search_stats.get('selection_info', {}).get('complexity_score', 0)
+                    fig = create_complexity_gauge(complexity_score)
+                    st.plotly_chart(fig, use_container_width=True)
                     
-                    if stats.get('searched_chunks'):
-                        st.info(f"🔍 {stats['searched_chunks']}개 문서를 검색했습니다.")
+                    # 모델 선택 이유
+                    st.info(f"**선택 이유**: {search_stats.get('selection_info', {}).get('reason', 'N/A')}")
                     
+                    # 참고 자료
                     st.subheader("📚 참고 자료")
                     for i, result in enumerate(results[:3]):
-                        st.caption(f"**{result.source}** - 페이지 {result.page} (관련도: {result.score:.2f})")
-                        
-                        if result.document_date:
-                            st.caption(f"📅 문서 날짜: {result.document_date}")
-                        
+                        st.caption(f"**{result.source}** - 페이지 {result.page}")
                         with st.container():
-                            content = result.content[:300] + "..." if len(result.content) > 300 else result.content
-                            st.text(content)
-                    
-                    if total_time < 5:
-                        st.success("⚡ 매우 빠른 응답 속도!")
-                    elif total_time < 10:
-                        st.info("✅ 적절한 응답 속도")
-                    else:
-                        st.warning("⏰ 응답 시간이 다소 길었습니다 (복잡한 질문으로 인한 정상적인 처리)")
+                            content_preview = result.content[:300] + "..." if len(result.content) > 300 else result.content
+                            st.text(content_preview)
                 
+                # 응답 데이터 저장
                 response_data = {
                     "answer": answer,
-                    "search_time": search_time,
-                    "generation_time": generation_time,
+                    "model_used": model_used,
+                    "cost": generation_stats.get('cost', 0),
                     "total_time": total_time,
-                    "complexity": complexity,
-                    "processing_mode": mode
+                    "complexity_score": complexity_score
                 }
                 st.session_state.messages.append({"role": "assistant", "content": response_data})
     
+    # 사이드바
+    with st.sidebar:
+        st.header("💰 비용 관리 대시보드")
+        
+        # 예산 현황
+        budget_manager = BudgetManager()
+        budget_status = budget_manager.get_current_status()
+        
+        # 파이 차트
+        fig = create_budget_pie_chart(budget_status['used'], budget_status['remaining'])
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # 모델별 사용 통계
+        if 'model_usage_stats' not in st.session_state:
+            st.session_state.model_usage_stats = {
+                'gpt-4o-mini': {'count': 0, 'total_cost': 0},
+                'o4-mini': {'count': 0, 'total_cost': 0},
+                'gpt-4o': {'count': 0, 'total_cost': 0}
+            }
+        
+        st.subheader("📊 모델별 사용 현황")
+        stats_df = pd.DataFrame(st.session_state.model_usage_stats).T
+        if not stats_df.empty:
+            stats_df.columns = ['사용 횟수', '총 비용($)']
+            st.dataframe(stats_df)
+        
+        st.divider()
+        
+        # 예시 질문
+        st.header("💡 예시 질문")
+        
+        st.subheader("🟢 간단한 질문")
+        example_simple = [
+            "대규모내부거래 공시 기한은?",
+            "이사회 의결 금액 기준은?",
+            "현황공시는 언제 해야 하나요?"
+        ]
+        for example in example_simple:
+            if st.button(example, key=f"simple_{example}"):
+                st.session_state.new_question = example
+                st.rerun()
+        
+        st.subheader("🟡 표준 질문")
+        example_standard = [
+            "계열사와 자금거래 시 절차는?",
+            "비상장사 주식 양도 시 필요한 서류는?",
+            "대규모내부거래 면제 조건은?"
+        ]
+        for example in example_standard:
+            if st.button(example, key=f"standard_{example}"):
+                st.session_state.new_question = example
+                st.rerun()
+        
+        st.subheader("🔵 복잡한 질문")
+        example_complex = [
+            "A회사가 B계열사에 자금을 대여하면서 동시에 C계열사의 지분을 취득하는 경우 적용되는 규제는?",
+            "여러 계열사와 동시에 거래할 때 검토해야 할 사항들을 종합적으로 설명해주세요"
+        ]
+        for example in example_complex:
+            if st.button(example, key=f"complex_{example}"):
+                st.session_state.new_question = example
+                st.rerun()
+        
+        st.divider()
+        
+        # 비용 절감 팁
+        st.info("""
+        💡 **비용 절감 팁**
+        - 간단한 정의는 자동으로 저렴한 모델 사용
+        - 유사한 질문은 캐시 활용
+        - o4-mini가 대부분의 분석에 최적
+        """)
+    
+    # 페이지 하단
     st.divider()
     st.caption("⚠️ 본 답변은 AI가 생성한 참고자료입니다. 중요한 사항은 반드시 원문을 확인하시기 바랍니다.")
     
-    with st.sidebar:
-        st.header("💡 예시 질문")
-        
-        st.subheader("🟢 단순 질문")
-        if st.button("대규모내부거래 공시 기한은?"):
-            st.session_state.new_question = "대규모내부거래 이사회 의결 후 공시 기한은 며칠인가요?"
-            st.rerun()
-        if st.button("이사회 의결 금액 기준은?"):
-            st.session_state.new_question = "대규모내부거래에서 이사회 의결이 필요한 거래 금액은?"
-            st.rerun()
-            
-        st.subheader("🟡 중간 복잡도")
-        if st.button("계열사 거래 시 주의사항은?"):
-            st.session_state.new_question = "계열사와 자금거래를 할 때 어떤 절차를 거쳐야 하고 주의할 점은 무엇인가요?"
-            st.rerun()
-        if st.button("비상장사 주식 양도 절차는?"):
-            st.session_state.new_question = "비상장회사가 주식을 양도할 때 필요한 절차와 공시 의무는 어떻게 되나요?"
-            st.rerun()
-            
-        st.subheader("🔴 복잡한 질문")
-        if st.button("복합 거래 분석"):
-            st.session_state.new_question = "A회사가 B계열사에 자금을 대여하면서 동시에 C계열사의 주식을 취득하는 경우, 각각 어떤 규제가 적용되고 공시는 어떻게 해야 하나요?"
-            st.rerun()
-        if st.button("종합적 리스크 검토"):
-            st.session_state.new_question = "우리 회사가 여러 계열사와 동시에 거래를 진행할 때 대규모내부거래 규제와 관련하여 종합적으로 검토해야 할 리스크와 대응 전략은?"
-            st.rerun()
-        
-        st.divider()
-        st.caption("💡 AI가 모든 질문의 핵심을 파악하여 최적의 답변을 제공합니다.")
-    
+    # 새 질문 처리
     if "new_question" in st.session_state:
+        # 입력창에 질문 설정하는 방법이 streamlit에서는 직접적으로 불가능하므로
+        # 메시지에 추가하고 rerun
         st.session_state.messages.append({"role": "user", "content": st.session_state.new_question})
         del st.session_state.new_question
         st.rerun()
